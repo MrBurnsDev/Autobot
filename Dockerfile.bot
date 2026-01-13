@@ -1,0 +1,75 @@
+# Build stage
+FROM node:20-alpine AS builder
+
+# Install pnpm
+RUN corepack enable && corepack prepare pnpm@9.15.0 --activate
+
+WORKDIR /app
+
+# Copy package files
+COPY package.json pnpm-workspace.yaml pnpm-lock.yaml* ./
+COPY packages/db/package.json ./packages/db/
+COPY packages/core/package.json ./packages/core/
+COPY packages/solana-adapter/package.json ./packages/solana-adapter/
+COPY packages/avalanche-adapter/package.json ./packages/avalanche-adapter/
+COPY services/bot/package.json ./services/bot/
+
+# Install dependencies
+RUN pnpm install --frozen-lockfile
+
+# Copy source code
+COPY tsconfig.base.json ./
+COPY packages/ ./packages/
+COPY services/bot/ ./services/bot/
+
+# Generate Prisma client
+RUN pnpm --filter @autobot/db generate
+
+# Build all packages
+RUN pnpm --filter @autobot/db build
+RUN pnpm --filter @autobot/core build
+RUN pnpm --filter @autobot/solana-adapter build
+RUN pnpm --filter @autobot/avalanche-adapter build
+RUN pnpm --filter @autobot/bot build
+
+# Production stage
+FROM node:20-alpine AS runner
+
+RUN corepack enable && corepack prepare pnpm@9.15.0 --activate
+
+WORKDIR /app
+
+# Copy built files
+COPY --from=builder /app/package.json ./
+COPY --from=builder /app/pnpm-workspace.yaml ./
+COPY --from=builder /app/pnpm-lock.yaml* ./
+
+# Copy package.json files for workspace resolution
+COPY --from=builder /app/packages/db/package.json ./packages/db/
+COPY --from=builder /app/packages/core/package.json ./packages/core/
+COPY --from=builder /app/packages/solana-adapter/package.json ./packages/solana-adapter/
+COPY --from=builder /app/packages/avalanche-adapter/package.json ./packages/avalanche-adapter/
+COPY --from=builder /app/services/bot/package.json ./services/bot/
+
+# Copy built dist folders
+COPY --from=builder /app/packages/db/dist ./packages/db/dist
+COPY --from=builder /app/packages/db/prisma ./packages/db/prisma
+COPY --from=builder /app/packages/core/dist ./packages/core/dist
+COPY --from=builder /app/packages/solana-adapter/dist ./packages/solana-adapter/dist
+COPY --from=builder /app/packages/avalanche-adapter/dist ./packages/avalanche-adapter/dist
+COPY --from=builder /app/services/bot/dist ./services/bot/dist
+
+# Copy node_modules
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/packages/db/node_modules ./packages/db/node_modules
+COPY --from=builder /app/services/bot/node_modules ./services/bot/node_modules
+
+# Run database migrations on startup
+COPY --from=builder /app/packages/db/prisma ./packages/db/prisma
+
+ENV NODE_ENV=production
+
+EXPOSE 3001
+
+# Run migrations then start the bot
+CMD ["sh", "-c", "cd packages/db && npx prisma migrate deploy && cd /app && node services/bot/dist/index.js"]

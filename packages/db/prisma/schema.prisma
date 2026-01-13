@@ -1,0 +1,341 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Supported blockchain networks
+enum Chain {
+  SOLANA
+  AVALANCHE
+}
+
+// Trade side
+enum TradeSide {
+  BUY
+  SELL
+}
+
+// Trade status
+enum TradeStatus {
+  PENDING
+  SUBMITTED
+  CONFIRMED
+  FAILED
+  EXPIRED
+}
+
+// Bot instance status
+enum BotStatus {
+  STOPPED
+  RUNNING
+  PAUSED
+  ERROR
+}
+
+// Alert types
+enum AlertType {
+  BOT_STARTED
+  BOT_STOPPED
+  TRADE_EXECUTED
+  TRADE_FAILED
+  CIRCUIT_BREAKER
+  DAILY_SUMMARY
+  ERROR
+}
+
+// Trade size mode
+enum TradeSizeMode {
+  FIXED_QUOTE
+  FIXED_BASE
+  PERCENT_BALANCE
+}
+
+// Starting mode for new bots
+enum StartingMode {
+  START_BY_BUYING
+  START_BY_SELLING
+  START_NEUTRAL
+}
+
+// PnL calculation method
+enum PnLMethod {
+  AVERAGE_COST
+  FIFO
+}
+
+// Bot configuration - stores all user-configurable parameters
+model BotConfig {
+  id                    String        @id @default(cuid())
+  name                  String
+  chain                 Chain
+  baseMint              String        // SOL mint or WAVAX address
+  quoteMint             String        // USDC mint/address
+
+  // Strategy parameters
+  buyDipPct             Float         @default(2.0)    // Buy when price drops X% from last sell
+  sellRisePct           Float         @default(5.0)    // Sell when price rises X% from last buy
+  tradeSizeMode         TradeSizeMode @default(FIXED_QUOTE)
+  tradeSize             Float         @default(25.0)   // Size in quote (USDC) or base depending on mode
+  minTradeNotional      Float         @default(10.0)   // Minimum trade size in USDC
+  maxSlippageBps        Int           @default(50)     // Max slippage in basis points
+  maxPriceImpactBps     Int?          @default(100)    // Max price impact if available
+
+  // Timing
+  cooldownSeconds       Int           @default(60)     // Min seconds between trades
+  maxTradesPerHour      Int           @default(10)
+
+  // Safety controls
+  dailyLossLimitUsdc    Float?        @default(50.0)   // Stop if daily loss exceeds this
+  maxDrawdownPct        Float?        @default(10.0)   // Stop if drawdown exceeds this
+  maxConsecutiveFailures Int          @default(3)
+  minBaseReserve        Float         @default(0.01)   // Keep this much SOL/AVAX for gas
+  minQuoteReserve       Float         @default(5.0)    // Keep this much USDC as reserve
+
+  // Take profit / stop loss at portfolio level
+  takeProfitUsdc        Float?
+  stopLossUsdc          Float?
+
+  // Starting configuration
+  startingMode          StartingMode  @default(START_BY_BUYING)
+
+  // PnL method
+  pnlMethod             PnLMethod     @default(AVERAGE_COST)
+
+  // Liquidity source preferences
+  allowedSources        String[]      @default([])     // Empty = all allowed
+  excludedSources       String[]      @default([])
+
+  // Price sanity check
+  maxPriceDeviationBps  Int           @default(200)    // Max deviation from secondary source
+
+  // RPC and API configuration (encrypted/env-referenced)
+  rpcUrl                String?       // Optional override
+
+  // Dry run mode (quotes only, no execution)
+  dryRunMode            Boolean       @default(false)
+
+  // Alerting
+  webhookUrl            String?
+  discordWebhookUrl     String?
+
+  createdAt             DateTime      @default(now())
+  updatedAt             DateTime      @updatedAt
+
+  // Relations
+  instances             BotInstance[]
+
+  @@index([chain])
+}
+
+// Running bot instance
+model BotInstance {
+  id                    String        @id @default(cuid())
+  configId              String
+  config                BotConfig     @relation(fields: [configId], references: [id], onDelete: Cascade)
+
+  status                BotStatus     @default(STOPPED)
+
+  // Reference prices for strategy decisions
+  lastBuyPrice          Float?        // USDC per base (SOL/AVAX)
+  lastSellPrice         Float?        // USDC per base
+  lastTradeAt           DateTime?
+
+  // Cumulative tracking
+  totalBuys             Int           @default(0)
+  totalSells            Int           @default(0)
+  totalBuyVolume        Float         @default(0)    // in quote (USDC)
+  totalSellVolume       Float         @default(0)
+
+  // Cost basis tracking
+  totalBaseCost         Float         @default(0)    // Total USDC spent on current base holdings
+  totalBaseQty          Float         @default(0)    // Current base holdings tracked by bot
+
+  // Safety state
+  consecutiveFailures   Int           @default(0)
+  tradesThisHour        Int           @default(0)
+  hourlyResetAt         DateTime      @default(now())
+  dailyRealizedPnl      Float         @default(0)
+  dailyResetAt          DateTime      @default(now())
+
+  // Error tracking
+  lastError             String?
+  lastErrorAt           DateTime?
+
+  // Pause reason
+  pauseReason           String?
+
+  startedAt             DateTime?
+  stoppedAt             DateTime?
+  createdAt             DateTime      @default(now())
+  updatedAt             DateTime      @updatedAt
+
+  // Relations
+  tradeAttempts         TradeAttempt[]
+  positionSnapshots     PositionSnapshot[]
+  pnlSnapshots          PnLSnapshot[]
+  alerts                AlertEvent[]
+
+  @@index([configId])
+  @@index([status])
+}
+
+// Individual trade attempt (may succeed or fail)
+model TradeAttempt {
+  id                    String        @id @default(cuid())
+  instanceId            String
+  instance              BotInstance   @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+
+  // Idempotency key to prevent duplicate execution
+  clientOrderId         String        @unique
+
+  side                  TradeSide
+  status                TradeStatus   @default(PENDING)
+
+  // Quote data
+  quotePrice            Float         // Expected price from quote
+  quotedBaseQty         Float
+  quotedQuoteQty        Float
+  quotedPriceImpactBps  Int?
+  quotedSlippageBps     Int?
+
+  // Transaction data
+  txSignature           String?       // Solana signature or Avalanche tx hash
+
+  // Execution result (filled from on-chain data)
+  fill                  TradeFill?
+
+  // Error details
+  errorCode             String?
+  errorMessage          String?
+
+  attemptedAt           DateTime      @default(now())
+  submittedAt           DateTime?
+  confirmedAt           DateTime?
+
+  createdAt             DateTime      @default(now())
+  updatedAt             DateTime      @updatedAt
+
+  @@index([instanceId])
+  @@index([status])
+  @@index([clientOrderId])
+}
+
+// Confirmed trade fill with actual execution data
+model TradeFill {
+  id                    String        @id @default(cuid())
+  attemptId             String        @unique
+  attempt               TradeAttempt  @relation(fields: [attemptId], references: [id], onDelete: Cascade)
+
+  side                  TradeSide
+
+  // Actual execution amounts (from on-chain data)
+  baseQty               Float         // Amount of SOL/AVAX traded
+  quoteQty              Float         // Amount of USDC traded
+  executedPrice         Float         // quoteQty / baseQty
+
+  // Fees
+  feeQuote              Float         @default(0)    // Fee in quote currency
+  feeNative             Float         @default(0)    // Gas/network fee in native token
+  feeNativeUsdc         Float         @default(0)    // Gas fee converted to USDC
+
+  // Actual slippage
+  actualSlippageBps     Int?
+
+  // For PnL calculation (set at fill time)
+  costBasisPerUnit      Float?        // For sells: avg cost per base unit sold
+  realizedPnl           Float?        // For sells: profit/loss on this trade
+
+  // Transaction details
+  txSignature           String
+  blockNumber           BigInt?       // For Avalanche
+  slot                  BigInt?       // For Solana
+
+  executedAt            DateTime
+  createdAt             DateTime      @default(now())
+
+  @@index([attemptId])
+  @@index([executedAt])
+}
+
+// Periodic position snapshots for charting
+model PositionSnapshot {
+  id                    String        @id @default(cuid())
+  instanceId            String
+  instance              BotInstance   @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+
+  // Balances at snapshot time
+  baseBalance           Float         // SOL/AVAX balance
+  quoteBalance          Float         // USDC balance
+
+  // Current price
+  markPrice             Float         // Current executable price
+
+  // Portfolio value
+  totalValueUsdc        Float         // baseBalance * markPrice + quoteBalance
+
+  snapshotAt            DateTime      @default(now())
+
+  @@index([instanceId])
+  @@index([snapshotAt])
+}
+
+// Daily PnL snapshots
+model PnLSnapshot {
+  id                    String        @id @default(cuid())
+  instanceId            String
+  instance              BotInstance   @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+
+  date                  DateTime      @db.Date
+
+  // PnL figures
+  realizedPnl           Float         // Sum of realized PnL for the day
+  unrealizedPnl         Float         // Mark-to-market unrealized at end of day
+  totalPnl              Float         // realized + unrealized
+
+  // Fee totals
+  totalFees             Float         // Quote currency fees
+  totalGasFees          Float         // Gas fees in USDC equivalent
+
+  // Trade counts
+  buyCount              Int
+  sellCount             Int
+  buyVolume             Float
+  sellVolume            Float
+
+  // Portfolio value at snapshot
+  portfolioValue        Float
+
+  createdAt             DateTime      @default(now())
+
+  @@unique([instanceId, date])
+  @@index([instanceId])
+  @@index([date])
+}
+
+// Alert and notification events
+model AlertEvent {
+  id                    String        @id @default(cuid())
+  instanceId            String?
+  instance              BotInstance?  @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+
+  type                  AlertType
+  title                 String
+  message               String
+  metadata              Json?
+
+  // Delivery status
+  webhookDelivered      Boolean       @default(false)
+  webhookError          String?
+  discordDelivered      Boolean       @default(false)
+  discordError          String?
+
+  createdAt             DateTime      @default(now())
+
+  @@index([instanceId])
+  @@index([type])
+  @@index([createdAt])
+}
