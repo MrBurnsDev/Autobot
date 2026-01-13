@@ -1,5 +1,7 @@
-import Decimal from 'decimal.js';
+import DecimalJS from 'decimal.js';
 import { createHash, randomUUID } from 'crypto';
+
+const Decimal = DecimalJS.default || DecimalJS;
 
 // Configure Decimal.js for financial calculations
 Decimal.set({ precision: 20, rounding: Decimal.ROUND_HALF_UP });

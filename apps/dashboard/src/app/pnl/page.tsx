@@ -8,7 +8,6 @@ import { Download, RefreshCw } from 'lucide-react';
 import {
   formatCurrency,
   formatNumber,
-  formatDate,
   getPnLColor,
 } from '@/lib/utils';
 import { useState } from 'react';

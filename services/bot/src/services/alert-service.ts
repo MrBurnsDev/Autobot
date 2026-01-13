@@ -1,4 +1,4 @@
-import { prisma, AlertType } from '@autobot/db';
+import { prisma, AlertType, Prisma } from '@autobot/db';
 import { Logger, retryWithBackoff } from '@autobot/core';
 
 const logger = new Logger('AlertService');
@@ -8,7 +8,7 @@ export interface AlertPayload {
   type: AlertType;
   title: string;
   message: string;
-  metadata?: Record<string, unknown>;
+  metadata?: Prisma.InputJsonValue;
 }
 
 export class AlertService {
@@ -28,7 +28,7 @@ export class AlertService {
         type: payload.type,
         title: payload.title,
         message: payload.message,
-        metadata: payload.metadata ?? {},
+        metadata: payload.metadata ?? undefined,
       },
     });
 

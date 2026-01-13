@@ -4,7 +4,7 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { configApi, healthApi } from '@/lib/api';
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/card';
 import { Button } from '@/components/button';
-import { Plus, Trash2, Edit, Check, X, RefreshCw } from 'lucide-react';
+import { Plus, Trash2, Edit, Check, RefreshCw } from 'lucide-react';
 import { useState } from 'react';
 
 const SOLANA_DEXES = [
@@ -27,23 +27,23 @@ const AVALANCHE_DEXES = [
 
 const defaultConfig = {
   name: '',
-  chain: 'SOLANA' as const,
+  chain: 'SOLANA' as 'SOLANA' | 'AVALANCHE',
   buyDipPct: 2,
   sellRisePct: 5,
-  tradeSizeMode: 'FIXED_QUOTE' as const,
+  tradeSizeMode: 'FIXED_QUOTE' as 'FIXED_QUOTE' | 'FIXED_BASE' | 'PERCENT_BALANCE',
   tradeSize: 25,
   minTradeNotional: 10,
   maxSlippageBps: 50,
-  maxPriceImpactBps: 100,
+  maxPriceImpactBps: 100 as number | null,
   cooldownSeconds: 60,
   maxTradesPerHour: 10,
-  dailyLossLimitUsdc: 50,
-  maxDrawdownPct: 10,
+  dailyLossLimitUsdc: 50 as number | null,
+  maxDrawdownPct: 10 as number | null,
   maxConsecutiveFailures: 3,
   minBaseReserve: 0.01,
   minQuoteReserve: 5,
-  startingMode: 'START_BY_BUYING' as const,
-  pnlMethod: 'AVERAGE_COST' as const,
+  startingMode: 'START_BY_BUYING' as 'START_BY_BUYING' | 'START_BY_SELLING' | 'START_NEUTRAL',
+  pnlMethod: 'AVERAGE_COST' as 'AVERAGE_COST' | 'FIFO',
   allowedSources: [] as string[],
   excludedSources: [] as string[],
   maxPriceDeviationBps: 200,

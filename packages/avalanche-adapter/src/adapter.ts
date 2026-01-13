@@ -96,7 +96,8 @@ export class AvalancheAdapter implements ChainAdapter {
       const avaxAmount = parseFloat(formatUnits(avaxBalance, AVAX_DECIMALS));
 
       // Get USDC balance
-      const usdcBalance = await this.usdcContract.balanceOf(this.wallet.address);
+      const balanceOfFn = this.usdcContract.balanceOf as (address: string) => Promise<bigint>;
+      const usdcBalance = await balanceOfFn(this.wallet.address);
       const usdcAmount = parseFloat(formatUnits(usdcBalance, USDC_DECIMALS));
 
       logger.debug('Fetched balances', {
@@ -365,7 +366,8 @@ export class AvalancheAdapter implements ChainAdapter {
     const token = new Contract(tokenAddress, ERC20_ABI, this.wallet);
 
     // Check current allowance
-    const currentAllowance = await token.allowance(this.wallet.address, spenderAddress);
+    const allowanceFn = token.allowance as (owner: string, spender: string) => Promise<bigint>;
+    const currentAllowance = await allowanceFn(this.wallet.address, spenderAddress);
 
     if (currentAllowance >= requiredAmount) {
       logger.debug('Sufficient allowance exists', {
@@ -384,7 +386,8 @@ export class AvalancheAdapter implements ChainAdapter {
     });
 
     // Approve exact amount (not unlimited)
-    const approveTx = await token.approve(spenderAddress, requiredAmount);
+    const approveFn = token.approve as (spender: string, amount: bigint) => Promise<{ hash: string; wait: () => Promise<{ status: number } | null> }>;
+    const approveTx = await approveFn(spenderAddress, requiredAmount);
     const receipt = await approveTx.wait();
 
     if (!receipt || receipt.status === 0) {

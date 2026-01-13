@@ -168,8 +168,7 @@ export default function TradesPage() {
                 </thead>
                 <tbody>
                   {tradesData?.trades.map((trade) => {
-                    const chain =
-                      trade.instance?.config?.chain || selectedBot?.config?.chain || 'SOLANA';
+                    const chain = selectedBot?.config?.chain || 'SOLANA';
                     return (
                       <tr key={trade.id} className="border-b border-border">
                         <td className="py-3 px-2 text-sm">

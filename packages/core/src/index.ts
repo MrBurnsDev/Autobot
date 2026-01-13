@@ -9,3 +9,6 @@ export * from './utils/index.js';
 
 // Strategy
 export * from './strategy/index.js';
+
+// Execution (cost calculation, regime classification, split execution)
+export * from './execution/index.js';

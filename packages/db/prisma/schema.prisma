@@ -67,6 +67,19 @@ enum PnLMethod {
   FIFO
 }
 
+// Exit mode for sell strategy
+enum ExitMode {
+  FULL_EXIT     // Default: sell entire position at target
+  SCALE_OUT     // Sell primary portion, hold remainder for extension
+}
+
+// Extension state for scale-out mode
+enum ExtensionState {
+  NONE          // No active extension
+  ACTIVE        // Extension in progress, holding remainder
+  TRAILING      // Trailing stop activated (if enabled)
+}
+
 // Bot configuration - stores all user-configurable parameters
 model BotConfig {
   id                    String        @id @default(cuid())
@@ -118,6 +131,84 @@ model BotConfig {
   // Dry run mode (quotes only, no execution)
   dryRunMode            Boolean       @default(false)
 
+  // === EXECUTION COST & NET EDGE CONFIGURATION ===
+  // Minimum net edge required to execute (default 0.40%)
+  minimumNetEdgePct     Float         @default(0.40)
+
+  // Estimated DEX fee percentage (varies by venue)
+  estimatedDexFeePct    Float         @default(0.05)
+
+  // Priority fee impact estimate (Solana-specific)
+  priorityFeeImpactPct  Float         @default(0.02)
+
+  // === SPLIT EXECUTION CONFIGURATION ===
+  // Max slippage for single-shot execution (default 0.25%)
+  maxSingleTradeSlippagePct Float     @default(0.25)
+
+  // Target slippage per chunk in split execution (default 0.15%)
+  targetChunkSlippagePct    Float     @default(0.15)
+
+  // Minimum chunk size in USDC
+  minChunkSizeUsdc          Float     @default(50.0)
+
+  // Maximum chunks per split execution
+  maxChunksPerSplit         Int       @default(10)
+
+  // === DYNAMIC PROFIT TARGET TIERS ===
+  // When execution cost > 0.30%, use this sell target
+  sellTargetTier1Pct        Float     @default(1.4)
+  // When execution cost > 0.50%, use this sell target
+  sellTargetTier2Pct        Float     @default(1.6)
+  // When execution cost > 0.70%, DO NOT TRADE
+  maxExecutionCostPct       Float     @default(0.70)
+
+  // === CAPITAL-AWARE THRESHOLDS ===
+  // Portfolio value tiers for execution behavior
+  capitalTier1Usdc          Float     @default(5000)    // Below: single-shot only
+  capitalTier2Usdc          Float     @default(20000)   // Below: conditional split
+  capitalTier3Usdc          Float     @default(50000)   // Above: mandatory split
+
+  // === REGIME ADAPTATION ===
+  // Enable automatic parameter adaptation based on regime
+  enableRegimeAdaptation    Boolean   @default(true)
+
+  // Pause trading in CHAOS regime
+  pauseInChaosRegime        Boolean   @default(true)
+
+  // Volatility threshold for CHAOS detection (%)
+  chaosVolatilityThreshold  Float     @default(5.0)
+
+  // Range threshold for CHOP detection (%)
+  chopRangeThreshold        Float     @default(1.5)
+
+  // === SCALE-OUT EXIT MODE ===
+  // Exit mode: FULL_EXIT (default) or SCALE_OUT
+  exitMode                  ExitMode  @default(FULL_EXIT)
+
+  // Primary exit percentage (default 65%)
+  scaleOutPrimaryPct        Float     @default(0.65)
+
+  // Secondary/extension percentage (default 35%)
+  scaleOutSecondaryPct      Float     @default(0.35)
+
+  // Target for secondary exit (default 1.9%)
+  scaleOutSecondaryTargetPct Float    @default(1.9)
+
+  // Enable trailing stop for extension (default false)
+  scaleOutTrailingEnabled   Boolean   @default(false)
+
+  // Minimum price extension to justify holding (default 0.3%)
+  scaleOutMinExtensionPct   Float     @default(0.3)
+
+  // Minimum dollar profit to justify scale-out (default $2)
+  scaleOutMinDollarProfit   Float     @default(2.0)
+
+  // Trailing stop percentage from peak (default 1.0%)
+  scaleOutTrailingStopPct   Float     @default(1.0)
+
+  // Allow scale-out for WHALE tier (default false, requires explicit enable)
+  scaleOutAllowWhale        Boolean   @default(false)
+
   // Alerting
   webhookUrl            String?
   discordWebhookUrl     String?
@@ -154,6 +245,28 @@ model BotInstance {
   totalBaseCost         Float         @default(0)    // Total USDC spent on current base holdings
   totalBaseQty          Float         @default(0)    // Current base holdings tracked by bot
 
+  // === SCALE-OUT EXTENSION STATE ===
+  // Current extension state
+  extensionState        ExtensionState @default(NONE)
+
+  // Remaining base qty in extension (subset of totalBaseQty)
+  extensionBaseQty      Float         @default(0)
+
+  // Cost basis for extension portion
+  extensionBaseCost     Float         @default(0)
+
+  // Price at which primary exit occurred
+  extensionEntryPrice   Float?
+
+  // Peak price since extension started (for trailing)
+  extensionPeakPrice    Float?
+
+  // Timestamp when extension started
+  extensionStartedAt    DateTime?
+
+  // Realized PnL from primary exit (before extension completes)
+  extensionPrimaryPnl   Float         @default(0)
+
   // Safety state
   consecutiveFailures   Int           @default(0)
   tradesThisHour        Int           @default(0)
@@ -178,6 +291,9 @@ model BotInstance {
   positionSnapshots     PositionSnapshot[]
   pnlSnapshots          PnLSnapshot[]
   alerts                AlertEvent[]
+  marketAnalytics       MarketAnalytics[]
+  tradeRejections       TradeRejection[]
+  splitExecutions       SplitExecution[]
 
   @@index([configId])
   @@index([status])
@@ -338,4 +454,166 @@ model AlertEvent {
   @@index([instanceId])
   @@index([type])
   @@index([createdAt])
+}
+
+// Market regime classification
+enum MarketRegime {
+  CHOP      // Tight ranges, frequent reversals, fast cycles
+  TREND     // One-sided movement, long holding times
+  CHAOS     // Volatility spikes, slippage instability
+  UNKNOWN   // Insufficient data
+}
+
+// Trade rejection reason codes
+enum TradeRejectionReason {
+  NET_EDGE_TOO_LOW
+  EXECUTION_COST_TOO_HIGH
+  SLIPPAGE_EXCEEDED
+  PRICE_IMPACT_EXCEEDED
+  REGIME_CHAOS_PAUSE
+  CAPITAL_TIER_RESTRICTION
+  COOLDOWN_ACTIVE
+  RATE_LIMIT_EXCEEDED
+}
+
+// Hourly market analytics for regime detection
+model MarketAnalytics {
+  id                    String        @id @default(cuid())
+  instanceId            String
+  instance              BotInstance   @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+
+  // Time bucket
+  hourStart             DateTime
+
+  // Price range data
+  priceHigh             Float
+  priceLow              Float
+  priceOpen             Float
+  priceClose            Float
+  priceRangePct         Float         // (high - low) / open * 100
+
+  // Volatility metrics
+  volatility1h          Float         // Standard deviation of price samples
+  avgSlippageBps        Float         // Average actual slippage this hour
+  maxSlippageBps        Float         // Max slippage observed
+
+  // Cycle metrics
+  cyclesCompleted       Int           @default(0)   // BUY->SELL pairs completed
+  avgCycleTimeMinutes   Float?        // Average time from buy to sell
+  avgCycleProfitPct     Float?        // Average profit per cycle
+
+  // Trade counts
+  buyCount              Int           @default(0)
+  sellCount             Int           @default(0)
+  rejectedCount         Int           @default(0)
+  failedCount           Int           @default(0)
+
+  // Execution quality
+  avgExecutionCostPct   Float?        // Average total execution cost
+  avgNetEdgePct         Float?        // Average net edge achieved
+
+  // Regime classification
+  detectedRegime        MarketRegime  @default(UNKNOWN)
+
+  createdAt             DateTime      @default(now())
+
+  @@unique([instanceId, hourStart])
+  @@index([instanceId])
+  @@index([hourStart])
+  @@index([detectedRegime])
+}
+
+// Trade rejection log for analysis
+model TradeRejection {
+  id                    String               @id @default(cuid())
+  instanceId            String
+  instance              BotInstance          @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+
+  side                  TradeSide
+  reason                TradeRejectionReason
+
+  // Metrics at rejection time
+  intendedSizeUsdc      Float
+  currentPrice          Float
+  quotedSlippagePct     Float?
+  estimatedFeePct       Float?
+  executionCostPct      Float?
+  netEdgePct            Float?
+  sellTargetPct         Float?
+  portfolioValueUsdc    Float?
+
+  // Context
+  currentRegime         MarketRegime?
+  capitalTier           String?
+
+  createdAt             DateTime      @default(now())
+
+  @@index([instanceId])
+  @@index([reason])
+  @@index([createdAt])
+}
+
+// Split execution tracking
+model SplitExecution {
+  id                    String        @id @default(cuid())
+  instanceId            String
+  instance              BotInstance   @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+
+  // Parent order info
+  parentOrderId         String        @unique
+  side                  TradeSide
+  totalIntendedSize     Float         // Total amount intended
+  totalChunks           Int           // Planned number of chunks
+
+  // Aggregated results
+  completedChunks       Int           @default(0)
+  abortedChunks         Int           @default(0)
+  totalBaseExecuted     Float         @default(0)
+  totalQuoteExecuted    Float         @default(0)
+  weightedAvgPrice      Float?        // Weighted average execution price
+  totalFees             Float         @default(0)
+  totalSlippageCost     Float         @default(0)
+
+  // Status
+  status                TradeStatus   @default(PENDING)
+  abortReason           String?
+
+  startedAt             DateTime      @default(now())
+  completedAt           DateTime?
+
+  // Individual chunk records
+  chunks                SplitChunk[]
+
+  @@index([instanceId])
+  @@index([parentOrderId])
+}
+
+// Individual chunk within a split execution
+model SplitChunk {
+  id                    String        @id @default(cuid())
+  splitExecutionId      String
+  splitExecution        SplitExecution @relation(fields: [splitExecutionId], references: [id], onDelete: Cascade)
+
+  chunkIndex            Int
+  intendedSize          Float
+
+  // Quote at execution time
+  quotedPrice           Float?
+  quotedSlippageBps     Int?
+
+  // Execution result
+  status                TradeStatus   @default(PENDING)
+  executedBaseQty       Float?
+  executedQuoteQty      Float?
+  executedPrice         Float?
+  actualSlippageBps     Int?
+  feeNativeUsdc         Float?
+
+  txSignature           String?
+  errorMessage          String?
+
+  attemptedAt           DateTime      @default(now())
+  completedAt           DateTime?
+
+  @@index([splitExecutionId])
 }

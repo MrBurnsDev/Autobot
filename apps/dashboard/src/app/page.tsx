@@ -1,7 +1,7 @@
 'use client';
 
 import { useQuery } from '@tanstack/react-query';
-import { botApi, healthApi, tradesApi } from '@/lib/api';
+import { botApi, healthApi } from '@/lib/api';
 import { StatCard } from '@/components/stat-card';
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/card';
 import { Button } from '@/components/button';
@@ -9,11 +9,9 @@ import {
   Activity,
   DollarSign,
   TrendingUp,
-  Clock,
   CheckCircle,
   XCircle,
   Play,
-  Square,
 } from 'lucide-react';
 import {
   formatCurrency,
@@ -25,7 +23,7 @@ import {
 import Link from 'next/link';
 
 export default function OverviewPage() {
-  const { data: bots, isLoading: botsLoading } = useQuery({
+  const { data: bots } = useQuery({
     queryKey: ['bots'],
     queryFn: botApi.list,
   });

@@ -53,6 +53,14 @@ export interface BotInstance {
   lastError: string | null;
   pauseReason: string | null;
   config?: BotConfig;
+  // Extension state for scale-out mode
+  extensionState?: 'NONE' | 'ACTIVE' | 'TRAILING';
+  extensionBaseQty?: number;
+  extensionBaseCost?: number;
+  extensionEntryPrice?: number | null;
+  extensionPeakPrice?: number | null;
+  extensionStartedAt?: string | null;
+  extensionPrimaryPnl?: number;
 }
 
 export interface BotStatus {

@@ -167,6 +167,24 @@ export default function BotsPage() {
                         <span>Last trade: {formatRelativeTime(bot.lastTradeAt)}</span>
                       )}
                     </div>
+                    {/* Extension state indicator */}
+                    {bot.extensionState && bot.extensionState !== 'NONE' && (
+                      <div className="flex items-center gap-2 mt-1">
+                        <span className="px-2 py-0.5 rounded text-xs font-medium bg-purple-500/20 text-purple-400">
+                          Extension {bot.extensionState}
+                        </span>
+                        <span className="text-xs text-muted-foreground">
+                          Holding {bot.extensionBaseQty?.toFixed(4) || '0'} @ entry{' '}
+                          {bot.extensionEntryPrice?.toFixed(4) || '-'}
+                        </span>
+                        {bot.extensionPeakPrice && bot.extensionEntryPrice && (
+                          <span className="text-xs text-green-400">
+                            (peak: {bot.extensionPeakPrice.toFixed(4)}, +
+                            {(((bot.extensionPeakPrice - bot.extensionEntryPrice) / bot.extensionEntryPrice) * 100).toFixed(2)}%)
+                          </span>
+                        )}
+                      </div>
+                    )}
                     {bot.lastError && (
                       <p className="text-sm text-red-400">{bot.lastError}</p>
                     )}

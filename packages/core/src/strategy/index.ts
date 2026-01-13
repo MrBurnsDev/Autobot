@@ -418,5 +418,3 @@ export class PnLCalculator {
     };
   }
 }
-
-export { TradingStrategy, PnLCalculator };

@@ -5,6 +5,10 @@ import {
   BotStatus,
   TradeSide,
   TradeStatus,
+  MarketRegime,
+  TradeRejectionReason,
+  ExitMode,
+  ExtensionState,
 } from '@autobot/db';
 import {
   TradingStrategy,
@@ -20,6 +24,25 @@ import {
   type StrategyAction,
   type QuoteResult,
   type FillForPnL,
+  // Execution modules
+  ExecutionCostCalculator,
+  RegimeClassifier,
+  CapitalTierEvaluator,
+  SplitExecutor,
+  formatExecutionCostLog,
+  formatRegimeLog,
+  type ExecutionCostConfig,
+  type RegimeConfig,
+  type HourlyAnalytics,
+  type RegimeClassification,
+  type SplitExecutionResult,
+  type ChunkResult,
+  // Scale-out modules
+  ScaleOutManager,
+  formatScaleOutLog,
+  type ScaleOutConfig,
+  type ExtensionStateData,
+  type ScaleOutDecision,
 } from '@autobot/core';
 import { getAdapter } from '../services/adapter-factory.js';
 import { AlertService } from '../services/alert-service.js';
@@ -31,6 +54,8 @@ interface WorkerState {
   isRunning: boolean;
   instanceId: string;
   loopHandle?: NodeJS.Timeout;
+  currentRegime: MarketRegime;
+  lastRegimeCheck: Date | null;
 }
 
 const workers = new Map<string, WorkerState>();
@@ -53,6 +78,8 @@ export async function startWorker(instanceId: string): Promise<void> {
   const workerState: WorkerState = {
     isRunning: true,
     instanceId,
+    currentRegime: 'UNKNOWN',
+    lastRegimeCheck: null,
   };
   workers.set(instanceId, workerState);
 
@@ -131,7 +158,7 @@ export function isWorkerRunning(instanceId: string): boolean {
 async function runTradingLoop(instanceId: string, workerState: WorkerState): Promise<void> {
   while (workerState.isRunning) {
     try {
-      await executeTradingCycle(instanceId);
+      await executeTradingCycle(instanceId, workerState);
     } catch (err) {
       logger.error('Trading cycle error', {
         instanceId,
@@ -153,7 +180,7 @@ async function runTradingLoop(instanceId: string, workerState: WorkerState): Pro
   }
 }
 
-async function executeTradingCycle(instanceId: string): Promise<void> {
+async function executeTradingCycle(instanceId: string, workerState: WorkerState): Promise<void> {
   // Fetch current instance and config
   const instance = await prisma.botInstance.findUnique({
     where: { id: instanceId },
@@ -169,11 +196,15 @@ async function executeTradingCycle(instanceId: string): Promise<void> {
   const strategy = new TradingStrategy(buildStrategyConfig(botConfig));
   const pnlCalculator = new PnLCalculator(botConfig.pnlMethod);
 
+  // Build execution modules
+  const costCalculator = buildCostCalculator(botConfig);
+  const regimeClassifier = buildRegimeClassifier(botConfig);
+
   // Get current balances
   const balances = await adapter.getBalances();
 
-  // Get quote for price discovery
-  const quote = await adapter.getQuote({
+  // Calculate portfolio value
+  const discoveryQuote = await adapter.getQuote({
     side: 'BUY',
     amount: botConfig.minTradeNotional,
     amountIsBase: false,
@@ -182,7 +213,63 @@ async function executeTradingCycle(instanceId: string): Promise<void> {
     excludedSources: botConfig.excludedSources,
   });
 
-  const currentPrice = quote.price;
+  const currentPrice = discoveryQuote.price;
+  const portfolioValueUsdc = balances.base * currentPrice + balances.quote;
+
+  // === REGIME CLASSIFICATION ===
+  // Check regime periodically (every hour)
+  const now = new Date();
+  const shouldCheckRegime = !workerState.lastRegimeCheck ||
+    now.getTime() - workerState.lastRegimeCheck.getTime() >= 3600000; // 1 hour
+
+  if (shouldCheckRegime && botConfig.enableRegimeAdaptation) {
+    const regimeResult = await classifyCurrentRegime(instanceId, regimeClassifier);
+    workerState.currentRegime = regimeResult.regime;
+    workerState.lastRegimeCheck = now;
+
+    logger.info('Regime classified', {
+      instanceId,
+      log: formatRegimeLog(regimeResult),
+    });
+
+    // Record regime in current hour's analytics
+    await updateHourlyAnalyticsRegime(instanceId, regimeResult.regime);
+
+    // Check if we should pause for CHAOS
+    if (regimeResult.regime === 'CHAOS' && botConfig.pauseInChaosRegime) {
+      // If in extension, force exit before pausing
+      if (instance.extensionState !== 'NONE') {
+        logger.warn('CHAOS regime with active extension - forcing extension exit');
+        await forceExtensionExit(instanceId, instance, adapter, botConfig, pnlCalculator, currentPrice, 'CHAOS regime');
+      }
+      await pauseBot(instanceId, 'CHAOS regime detected - trading paused for safety', botConfig);
+      return;
+    }
+  }
+
+  // === SCALE-OUT EXTENSION CHECK ===
+  // If in extension state, check for extension exit BEFORE normal strategy
+  if (instance.extensionState !== 'NONE') {
+    const extensionHandled = await checkExtensionExit(
+      instanceId,
+      instance,
+      adapter,
+      botConfig,
+      pnlCalculator,
+      costCalculator,
+      currentPrice,
+      portfolioValueUsdc,
+      workerState.currentRegime,
+      discoveryQuote
+    );
+
+    if (extensionHandled) {
+      // Update peak price for trailing (even if not exiting)
+      await updateExtensionPeakPrice(instanceId, instance, currentPrice);
+      await maybeSnapshotPosition(instanceId, balances, currentPrice);
+      return; // Don't proceed to normal strategy evaluation
+    }
+  }
 
   // Build strategy state
   const state = await buildStrategyState(instance);
@@ -193,7 +280,7 @@ async function executeTradingCycle(instanceId: string): Promise<void> {
     state,
     balances,
     currentPrice,
-    quote,
+    quote: discoveryQuote,
   });
 
   logger.debug('Strategy evaluation', {
@@ -201,13 +288,46 @@ async function executeTradingCycle(instanceId: string): Promise<void> {
     action: action.type,
     reason: action.reason,
     currentPrice,
+    regime: workerState.currentRegime,
+    extensionState: instance.extensionState,
   });
 
   // Handle action
   switch (action.type) {
     case 'BUY':
+      // BUY logic unchanged - only execute if not in extension
+      if (instance.extensionState !== 'NONE') {
+        logger.debug('Skipping BUY signal - extension active', { instanceId });
+        break;
+      }
+      await executeTradeWithCostGating(
+        instanceId,
+        action,
+        adapter,
+        botConfig,
+        pnlCalculator,
+        costCalculator,
+        currentPrice,
+        portfolioValueUsdc,
+        workerState.currentRegime
+      );
+      break;
+
     case 'SELL':
-      await executeTradeAction(instanceId, action, adapter, botConfig, pnlCalculator, currentPrice);
+      // SELL uses scale-out logic if enabled
+      await executeSellWithScaleOut(
+        instanceId,
+        action,
+        instance,
+        adapter,
+        botConfig,
+        pnlCalculator,
+        costCalculator,
+        currentPrice,
+        portfolioValueUsdc,
+        workerState.currentRegime,
+        discoveryQuote
+      );
       break;
 
     case 'PAUSE':
@@ -223,20 +343,26 @@ async function executeTradingCycle(instanceId: string): Promise<void> {
   await maybeSnapshotPosition(instanceId, balances, currentPrice);
 }
 
-async function executeTradeAction(
+/**
+ * Execute trade with execution cost gating and optional split execution
+ */
+async function executeTradeWithCostGating(
   instanceId: string,
   action: StrategyAction & { type: 'BUY' | 'SELL' },
   adapter: ChainAdapter,
   botConfig: BotConfig,
   pnlCalculator: PnLCalculator,
-  currentPrice: number
+  costCalculator: ExecutionCostCalculator,
+  currentPrice: number,
+  portfolioValueUsdc: number,
+  currentRegime: MarketRegime
 ): Promise<void> {
   const side: TradeSide = action.type;
 
   // Calculate trade amount
   const tradeSize = action.size;
-  const amount = tradeSize.quoteAmount ?? tradeSize.baseAmount ?? 0;
-  const amountIsBase = tradeSize.baseAmount !== undefined;
+  const amount = tradeSize.quoteAmount ?? (tradeSize.baseAmount ? tradeSize.baseAmount * currentPrice : 0);
+  const amountIsBase = tradeSize.baseAmount !== undefined && tradeSize.quoteAmount === undefined;
 
   // Generate idempotent order ID
   const clientOrderId = generateClientOrderId(instanceId, side, Date.now());
@@ -253,12 +379,51 @@ async function executeTradeAction(
   // Get fresh quote for execution
   const quote = await adapter.getQuote({
     side,
-    amount,
+    amount: amountIsBase ? (tradeSize.baseAmount ?? 0) : amount,
     amountIsBase,
     slippageBps: botConfig.maxSlippageBps,
     allowedSources: botConfig.allowedSources,
     excludedSources: botConfig.excludedSources,
   });
+
+  // === EXECUTION COST GATING ===
+  const costResult = costCalculator.calculateExecutionCost(quote);
+  logger.info('Execution cost calculated', {
+    instanceId,
+    log: formatExecutionCostLog(costResult),
+  });
+
+  if (!costResult.shouldExecute) {
+    // Log rejection
+    await logTradeRejection(
+      instanceId,
+      side,
+      costResult.rejectionCode as TradeRejectionReason || 'NET_EDGE_TOO_LOW',
+      {
+        intendedSizeUsdc: amount,
+        currentPrice,
+        quotedSlippagePct: costResult.quotedSlippagePct,
+        estimatedFeePct: costResult.estimatedDexFeePct + costResult.priorityFeeImpactPct,
+        executionCostPct: costResult.totalExecutionCostPct,
+        netEdgePct: costResult.netEdgePct,
+        sellTargetPct: costResult.effectiveSellTargetPct,
+        portfolioValueUsdc,
+        currentRegime,
+      }
+    );
+
+    logger.warn('Trade rejected by cost gating', {
+      instanceId,
+      clientOrderId,
+      reason: costResult.rejectionReason,
+      netEdge: costResult.netEdgePct,
+    });
+    return;
+  }
+
+  // === APPLY REGIME-BASED ADJUSTMENTS ===
+  // Adjust parameters based on current regime
+  const adjustedConfig = applyRegimeAdjustments(botConfig, currentRegime);
 
   // Create trade attempt record
   const tradeAttempt = await prisma.tradeAttempt.create({
@@ -285,6 +450,10 @@ async function executeTradeAction(
         outputAmount: quote.outputAmount,
         price: quote.price,
       },
+      costResult: {
+        netEdgePct: costResult.netEdgePct,
+        effectiveSellTarget: costResult.effectiveSellTargetPct,
+      },
     });
 
     await prisma.tradeAttempt.update({
@@ -297,12 +466,37 @@ async function executeTradeAction(
     return;
   }
 
+  // === DETERMINE EXECUTION MODE ===
+  const tierEvaluator = new CapitalTierEvaluator(
+    {
+      tier1Usdc: botConfig.capitalTier1Usdc,
+      tier2Usdc: botConfig.capitalTier2Usdc,
+      tier3Usdc: botConfig.capitalTier3Usdc,
+    },
+    {
+      maxSingleTradeSlippagePct: botConfig.maxSingleTradeSlippagePct,
+      targetChunkSlippagePct: botConfig.targetChunkSlippagePct,
+      minChunkSizeUsdc: botConfig.minChunkSizeUsdc,
+      maxChunksPerSplit: botConfig.maxChunksPerSplit,
+    }
+  );
+
+  const tierResult = tierEvaluator.evaluate(portfolioValueUsdc, amount);
+
+  logger.debug('Capital tier evaluated', {
+    instanceId,
+    tier: tierResult.tier,
+    executionMode: tierResult.executionMode,
+    shouldSplit: tierResult.shouldSplit,
+  });
+
   // Execute swap
   logger.info('Executing trade', {
     clientOrderId,
     side,
     inputAmount: quote.inputAmount,
     expectedOutput: quote.outputAmount,
+    executionMode: tierResult.executionMode,
   });
 
   await prisma.tradeAttempt.update({
@@ -310,34 +504,161 @@ async function executeTradeAction(
     data: { status: 'SUBMITTED', submittedAt: new Date() },
   });
 
+  // Execute based on whether we should split
+  if (tierResult.shouldSplit) {
+    // Split execution
+    await executeSplitTrade(
+      instanceId,
+      tradeAttempt.id,
+      side,
+      amount,
+      adapter,
+      botConfig,
+      pnlCalculator,
+      portfolioValueUsdc,
+      clientOrderId
+    );
+  } else {
+    // Single-shot execution
+    await executeSingleTrade(
+      instanceId,
+      tradeAttempt.id,
+      side,
+      quote,
+      adapter,
+      botConfig,
+      pnlCalculator,
+      clientOrderId
+    );
+  }
+}
+
+/**
+ * Execute a single-shot trade
+ */
+async function executeSingleTrade(
+  instanceId: string,
+  tradeAttemptId: string,
+  side: TradeSide,
+  quote: QuoteResult,
+  adapter: ChainAdapter,
+  botConfig: BotConfig,
+  pnlCalculator: PnLCalculator,
+  clientOrderId: string
+): Promise<void> {
   const result = await adapter.executeSwap({
     quote,
     clientOrderId,
   });
 
   if (!result.success) {
-    // Record failure
+    await handleTradeFailure(instanceId, tradeAttemptId, botConfig, result);
+    return;
+  }
+
+  // Process successful fill
+  await processSuccessfulFill(
+    instanceId,
+    tradeAttemptId,
+    side,
+    result,
+    botConfig,
+    pnlCalculator
+  );
+}
+
+/**
+ * Execute a split trade in sequential chunks
+ */
+async function executeSplitTrade(
+  instanceId: string,
+  tradeAttemptId: string,
+  side: TradeSide,
+  totalAmountUsdc: number,
+  adapter: ChainAdapter,
+  botConfig: BotConfig,
+  pnlCalculator: PnLCalculator,
+  portfolioValueUsdc: number,
+  clientOrderId: string
+): Promise<void> {
+  const splitExecutor = buildSplitExecutor(botConfig);
+
+  const splitResult = await splitExecutor.execute(
+    adapter,
+    side,
+    totalAmountUsdc,
+    portfolioValueUsdc,
+    botConfig.maxSlippageBps,
+    clientOrderId,
+    botConfig.allowedSources,
+    botConfig.excludedSources
+  );
+
+  // Record split execution
+  const splitExecution = await prisma.splitExecution.create({
+    data: {
+      instanceId,
+      parentOrderId: clientOrderId,
+      side,
+      totalIntendedSize: totalAmountUsdc,
+      totalChunks: splitResult.totalChunks,
+      completedChunks: splitResult.completedChunks,
+      abortedChunks: splitResult.abortedChunks,
+      totalBaseExecuted: splitResult.totalBaseExecuted,
+      totalQuoteExecuted: splitResult.totalQuoteExecuted,
+      weightedAvgPrice: splitResult.weightedAvgPrice,
+      totalFees: splitResult.totalFees,
+      totalSlippageCost: splitResult.totalSlippageCost,
+      status: splitResult.success ? 'CONFIRMED' : 'FAILED',
+      abortReason: splitResult.abortReason,
+      startedAt: splitResult.startedAt,
+      completedAt: splitResult.completedAt,
+    },
+  });
+
+  // Record individual chunks
+  for (const chunk of splitResult.chunks) {
+    await prisma.splitChunk.create({
+      data: {
+        splitExecutionId: splitExecution.id,
+        chunkIndex: chunk.chunkIndex,
+        intendedSize: totalAmountUsdc / splitResult.totalChunks,
+        quotedPrice: chunk.quote?.price,
+        quotedSlippageBps: chunk.quote?.priceImpactBps,
+        status: chunk.success ? 'CONFIRMED' : 'FAILED',
+        executedBaseQty: chunk.executedBaseQty || null,
+        executedQuoteQty: chunk.executedQuoteQty || null,
+        executedPrice: chunk.executedPrice || null,
+        actualSlippageBps: chunk.actualSlippageBps,
+        feeNativeUsdc: chunk.feeNativeUsdc || null,
+        txSignature: chunk.swap?.txSignature,
+        errorMessage: chunk.error,
+        attemptedAt: chunk.attemptedAt,
+        completedAt: chunk.completedAt,
+      },
+    });
+  }
+
+  if (!splitResult.success && splitResult.completedChunks === 0) {
+    // Complete failure
     await prisma.tradeAttempt.update({
-      where: { id: tradeAttempt.id },
+      where: { id: tradeAttemptId },
       data: {
         status: 'FAILED',
-        errorCode: result.error?.code,
-        errorMessage: result.error?.message,
-        txSignature: result.txSignature || undefined,
+        errorCode: 'SPLIT_EXECUTION_FAILED',
+        errorMessage: splitResult.abortReason,
       },
     });
 
-    // Increment failure counter
     await prisma.botInstance.update({
       where: { id: instanceId },
       data: {
         consecutiveFailures: { increment: 1 },
-        lastError: result.error?.message,
+        lastError: splitResult.abortReason,
         lastErrorAt: new Date(),
       },
     });
 
-    // Send alert
     const alertService = new AlertService(
       botConfig.webhookUrl ?? config.alerts.webhookUrl,
       botConfig.discordWebhookUrl ?? config.alerts.discordWebhookUrl
@@ -345,25 +666,95 @@ async function executeTradeAction(
     await alertService.sendAlert({
       instanceId,
       type: 'TRADE_FAILED',
-      title: 'Trade Failed',
-      message: `${side} trade failed: ${result.error?.message}`,
-      metadata: { clientOrderId, side },
+      title: 'Split Trade Failed',
+      message: `${side} split trade failed: ${splitResult.abortReason}`,
+      metadata: { clientOrderId, side, chunks: splitResult.totalChunks },
     });
 
     return;
   }
 
-  // Calculate PnL for this fill
+  // Process successful (or partial) split execution
+  await processSuccessfulSplitFill(
+    instanceId,
+    tradeAttemptId,
+    side,
+    splitResult,
+    botConfig,
+    pnlCalculator
+  );
+}
+
+/**
+ * Handle trade failure
+ */
+async function handleTradeFailure(
+  instanceId: string,
+  tradeAttemptId: string,
+  botConfig: BotConfig,
+  result: { txSignature: string; error?: { code: string; message: string } }
+): Promise<void> {
+  await prisma.tradeAttempt.update({
+    where: { id: tradeAttemptId },
+    data: {
+      status: 'FAILED',
+      errorCode: result.error?.code,
+      errorMessage: result.error?.message,
+      txSignature: result.txSignature || undefined,
+    },
+  });
+
+  await prisma.botInstance.update({
+    where: { id: instanceId },
+    data: {
+      consecutiveFailures: { increment: 1 },
+      lastError: result.error?.message,
+      lastErrorAt: new Date(),
+    },
+  });
+
+  const alertService = new AlertService(
+    botConfig.webhookUrl ?? config.alerts.webhookUrl,
+    botConfig.discordWebhookUrl ?? config.alerts.discordWebhookUrl
+  );
+  await alertService.sendAlert({
+    instanceId,
+    type: 'TRADE_FAILED',
+    title: 'Trade Failed',
+    message: `Trade failed: ${result.error?.message}`,
+  });
+}
+
+/**
+ * Process a successful single fill
+ */
+async function processSuccessfulFill(
+  instanceId: string,
+  tradeAttemptId: string,
+  side: TradeSide,
+  result: {
+    txSignature: string;
+    blockNumber?: bigint;
+    slot?: bigint;
+    inputAmount: number;
+    outputAmount: number;
+    executedPrice: number;
+    feeNative: number;
+    feeNativeUsdc: number;
+    actualSlippageBps: number | null;
+  },
+  botConfig: BotConfig,
+  pnlCalculator: PnLCalculator
+): Promise<void> {
   const fill: FillForPnL = {
     side,
     baseQty: side === 'BUY' ? result.outputAmount : result.inputAmount,
     quoteQty: side === 'BUY' ? result.inputAmount : result.outputAmount,
     executedPrice: result.executedPrice,
-    feeQuote: 0, // Fees are in native token
+    feeQuote: 0,
     feeNativeUsdc: result.feeNativeUsdc,
   };
 
-  // Get current cost basis for sells
   const instance = await prisma.botInstance.findUnique({
     where: { id: instanceId },
   });
@@ -380,7 +771,7 @@ async function executeTradeAction(
   // Record fill
   await prisma.tradeFill.create({
     data: {
-      attemptId: tradeAttempt.id,
+      attemptId: tradeAttemptId,
       side,
       baseQty: fill.baseQty,
       quoteQty: fill.quoteQty,
@@ -398,9 +789,8 @@ async function executeTradeAction(
     },
   });
 
-  // Update trade attempt
   await prisma.tradeAttempt.update({
-    where: { id: tradeAttempt.id },
+    where: { id: tradeAttemptId },
     data: {
       status: 'CONFIRMED',
       txSignature: result.txSignature,
@@ -409,6 +799,149 @@ async function executeTradeAction(
   });
 
   // Update instance state
+  await updateInstanceAfterFill(instanceId, side, fill, realizedPnl, pnlCalculator, instance);
+
+  // Send alert
+  const alertService = new AlertService(
+    botConfig.webhookUrl ?? config.alerts.webhookUrl,
+    botConfig.discordWebhookUrl ?? config.alerts.discordWebhookUrl
+  );
+  await alertService.sendAlert({
+    instanceId,
+    type: 'TRADE_EXECUTED',
+    title: `${side} Executed`,
+    message: `${side} ${fill.baseQty.toFixed(4)} ${botConfig.chain === 'SOLANA' ? 'SOL' : 'AVAX'} @ ${result.executedPrice.toFixed(4)} USDC`,
+    metadata: {
+      side,
+      baseQty: fill.baseQty,
+      quoteQty: fill.quoteQty,
+      price: result.executedPrice,
+      txSignature: result.txSignature,
+      realizedPnl: side === 'SELL' ? realizedPnl : undefined,
+    },
+  });
+
+  logger.info('Trade executed successfully', {
+    instanceId,
+    side,
+    baseQty: fill.baseQty,
+    quoteQty: fill.quoteQty,
+    price: result.executedPrice,
+    txSignature: result.txSignature,
+  });
+}
+
+/**
+ * Process a successful split fill
+ */
+async function processSuccessfulSplitFill(
+  instanceId: string,
+  tradeAttemptId: string,
+  side: TradeSide,
+  splitResult: SplitExecutionResult,
+  botConfig: BotConfig,
+  pnlCalculator: PnLCalculator
+): Promise<void> {
+  const fill: FillForPnL = {
+    side,
+    baseQty: splitResult.totalBaseExecuted,
+    quoteQty: splitResult.totalQuoteExecuted,
+    executedPrice: splitResult.weightedAvgPrice || 0,
+    feeQuote: 0,
+    feeNativeUsdc: splitResult.totalFees,
+  };
+
+  const instance = await prisma.botInstance.findUnique({
+    where: { id: instanceId },
+  });
+
+  let realizedPnl = 0;
+  let costBasisPerUnit = 0;
+
+  if (side === 'SELL' && instance && instance.totalBaseQty > 0) {
+    costBasisPerUnit = instance.totalBaseCost / instance.totalBaseQty;
+    const pnlResult = pnlCalculator.calculateRealizedPnL(fill, costBasisPerUnit);
+    realizedPnl = pnlResult.realizedPnl;
+  }
+
+  // Record aggregate fill from successful chunks
+  const successfulChunks = splitResult.chunks.filter((c: ChunkResult) => c.success);
+  if (successfulChunks.length > 0) {
+    const lastChunk = successfulChunks[successfulChunks.length - 1];
+    await prisma.tradeFill.create({
+      data: {
+        attemptId: tradeAttemptId,
+        side,
+        baseQty: fill.baseQty,
+        quoteQty: fill.quoteQty,
+        executedPrice: splitResult.weightedAvgPrice || 0,
+        feeQuote: 0,
+        feeNative: 0,
+        feeNativeUsdc: splitResult.totalFees,
+        actualSlippageBps: null, // Aggregate slippage not meaningful
+        costBasisPerUnit: side === 'SELL' ? costBasisPerUnit : null,
+        realizedPnl: side === 'SELL' ? realizedPnl : null,
+        txSignature: lastChunk?.swap?.txSignature || 'SPLIT_EXECUTION',
+        executedAt: new Date(),
+      },
+    });
+  }
+
+  await prisma.tradeAttempt.update({
+    where: { id: tradeAttemptId },
+    data: {
+      status: splitResult.fullyExecuted ? 'CONFIRMED' : 'CONFIRMED', // Partial is still confirmed
+      confirmedAt: new Date(),
+      errorMessage: splitResult.abortReason ? `Partial: ${splitResult.abortReason}` : null,
+    },
+  });
+
+  // Update instance state
+  await updateInstanceAfterFill(instanceId, side, fill, realizedPnl, pnlCalculator, instance);
+
+  // Send alert
+  const alertService = new AlertService(
+    botConfig.webhookUrl ?? config.alerts.webhookUrl,
+    botConfig.discordWebhookUrl ?? config.alerts.discordWebhookUrl
+  );
+  await alertService.sendAlert({
+    instanceId,
+    type: 'TRADE_EXECUTED',
+    title: `${side} Split Executed`,
+    message: `${side} ${fill.baseQty.toFixed(4)} ${botConfig.chain === 'SOLANA' ? 'SOL' : 'AVAX'} @ ${(splitResult.weightedAvgPrice || 0).toFixed(4)} USDC (${splitResult.completedChunks}/${splitResult.totalChunks} chunks)`,
+    metadata: {
+      side,
+      baseQty: fill.baseQty,
+      quoteQty: fill.quoteQty,
+      price: splitResult.weightedAvgPrice,
+      chunks: splitResult.completedChunks,
+      totalChunks: splitResult.totalChunks,
+      realizedPnl: side === 'SELL' ? realizedPnl : undefined,
+    },
+  });
+
+  logger.info('Split trade executed', {
+    instanceId,
+    side,
+    baseQty: fill.baseQty,
+    quoteQty: fill.quoteQty,
+    avgPrice: splitResult.weightedAvgPrice,
+    completedChunks: splitResult.completedChunks,
+    totalChunks: splitResult.totalChunks,
+  });
+}
+
+/**
+ * Update instance state after a fill
+ */
+async function updateInstanceAfterFill(
+  instanceId: string,
+  side: TradeSide,
+  fill: FillForPnL,
+  realizedPnl: number,
+  pnlCalculator: PnLCalculator,
+  instance: BotInstance | null
+): Promise<void> {
   const now = new Date();
   const updateData: Record<string, unknown> = {
     lastTradeAt: now,
@@ -417,11 +950,10 @@ async function executeTradeAction(
   };
 
   if (side === 'BUY') {
-    updateData.lastBuyPrice = result.executedPrice;
+    updateData.lastBuyPrice = fill.executedPrice;
     updateData.totalBuys = { increment: 1 };
     updateData.totalBuyVolume = { increment: fill.quoteQty };
 
-    // Update cost basis
     if (instance) {
       const costUpdate = pnlCalculator.updateCostBasis(
         instance.totalBaseCost,
@@ -432,12 +964,11 @@ async function executeTradeAction(
       updateData.totalBaseQty = costUpdate.newTotalQty;
     }
   } else {
-    updateData.lastSellPrice = result.executedPrice;
+    updateData.lastSellPrice = fill.executedPrice;
     updateData.totalSells = { increment: 1 };
     updateData.totalSellVolume = { increment: fill.quoteQty };
     updateData.dailyRealizedPnl = { increment: realizedPnl };
 
-    // Update cost basis after sell
     if (instance) {
       const positionUpdate = pnlCalculator.updatePositionAfterSell(
         instance.totalBaseCost,
@@ -465,35 +996,124 @@ async function executeTradeAction(
     where: { id: instanceId },
     data: updateData,
   });
+}
 
-  // Send success alert
-  const alertService = new AlertService(
-    botConfig.webhookUrl ?? config.alerts.webhookUrl,
-    botConfig.discordWebhookUrl ?? config.alerts.discordWebhookUrl
-  );
-  await alertService.sendAlert({
-    instanceId,
-    type: 'TRADE_EXECUTED',
-    title: `${side} Executed`,
-    message: `${side} ${fill.baseQty.toFixed(4)} ${botConfig.chain === 'SOLANA' ? 'SOL' : 'AVAX'} @ ${result.executedPrice.toFixed(4)} USDC`,
-    metadata: {
-      side,
-      baseQty: fill.baseQty,
-      quoteQty: fill.quoteQty,
-      price: result.executedPrice,
-      txSignature: result.txSignature,
-      realizedPnl: side === 'SELL' ? realizedPnl : undefined,
+/**
+ * Classify current market regime from recent analytics
+ */
+async function classifyCurrentRegime(
+  instanceId: string,
+  classifier: RegimeClassifier
+): Promise<RegimeClassification> {
+  // Get last 6 hours of analytics
+  const sixHoursAgo = new Date(Date.now() - 6 * 3600000);
+
+  const analytics = await prisma.marketAnalytics.findMany({
+    where: {
+      instanceId,
+      hourStart: { gte: sixHoursAgo },
     },
+    orderBy: { hourStart: 'desc' },
+    take: 6,
   });
 
-  logger.info('Trade executed successfully', {
-    instanceId,
-    clientOrderId,
-    side,
-    baseQty: fill.baseQty,
-    quoteQty: fill.quoteQty,
-    price: result.executedPrice,
-    txSignature: result.txSignature,
+  if (analytics.length === 0) {
+    return {
+      regime: 'UNKNOWN',
+      confidence: 0,
+      signals: [],
+      recommendation: {
+        shouldTrade: true,
+        buyDipMultiplier: 1.0,
+        sellTargetMultiplier: 1.0,
+        cooldownMultiplier: 1.0,
+        reason: 'Insufficient analytics data for regime classification',
+      },
+    };
+  }
+
+  const hourlyData: HourlyAnalytics[] = analytics.map(a => ({
+    priceRangePct: a.priceRangePct,
+    volatility1h: a.volatility1h,
+    avgSlippageBps: a.avgSlippageBps,
+    cyclesCompleted: a.cyclesCompleted,
+    avgCycleTimeMinutes: a.avgCycleTimeMinutes,
+    buyCount: a.buyCount,
+    sellCount: a.sellCount,
+    rejectedCount: a.rejectedCount,
+    failedCount: a.failedCount,
+  }));
+
+  return classifier.classify(hourlyData);
+}
+
+/**
+ * Update hourly analytics with detected regime
+ */
+async function updateHourlyAnalyticsRegime(
+  instanceId: string,
+  regime: MarketRegime
+): Promise<void> {
+  const hourStart = new Date();
+  hourStart.setMinutes(0, 0, 0);
+
+  await prisma.marketAnalytics.upsert({
+    where: {
+      instanceId_hourStart: { instanceId, hourStart },
+    },
+    create: {
+      instanceId,
+      hourStart,
+      priceHigh: 0,
+      priceLow: 0,
+      priceOpen: 0,
+      priceClose: 0,
+      priceRangePct: 0,
+      volatility1h: 0,
+      avgSlippageBps: 0,
+      maxSlippageBps: 0,
+      detectedRegime: regime,
+    },
+    update: {
+      detectedRegime: regime,
+    },
+  });
+}
+
+/**
+ * Log a trade rejection for analysis
+ */
+async function logTradeRejection(
+  instanceId: string,
+  side: TradeSide,
+  reason: TradeRejectionReason,
+  details: {
+    intendedSizeUsdc: number;
+    currentPrice: number;
+    quotedSlippagePct?: number;
+    estimatedFeePct?: number;
+    executionCostPct?: number;
+    netEdgePct?: number;
+    sellTargetPct?: number;
+    portfolioValueUsdc?: number;
+    currentRegime?: MarketRegime;
+  }
+): Promise<void> {
+  await prisma.tradeRejection.create({
+    data: {
+      instanceId,
+      side,
+      reason,
+      intendedSizeUsdc: details.intendedSizeUsdc,
+      currentPrice: details.currentPrice,
+      quotedSlippagePct: details.quotedSlippagePct,
+      estimatedFeePct: details.estimatedFeePct,
+      executionCostPct: details.executionCostPct,
+      netEdgePct: details.netEdgePct,
+      sellTargetPct: details.sellTargetPct,
+      portfolioValueUsdc: details.portfolioValueUsdc,
+      currentRegime: details.currentRegime,
+    },
   });
 }
 
@@ -567,6 +1187,64 @@ async function maybeSnapshotPosition(
   });
 }
 
+// === BUILDER FUNCTIONS ===
+
+function buildCostCalculator(botConfig: BotConfig): ExecutionCostCalculator {
+  const costConfig: ExecutionCostConfig = {
+    estimatedDexFeePct: botConfig.estimatedDexFeePct,
+    priorityFeeImpactPct: botConfig.priorityFeeImpactPct,
+    minimumNetEdgePct: botConfig.minimumNetEdgePct,
+    maxExecutionCostPct: botConfig.maxExecutionCostPct,
+    baseSellTargetPct: botConfig.sellRisePct,
+    sellTargetTier1Pct: botConfig.sellTargetTier1Pct,
+    sellTargetTier2Pct: botConfig.sellTargetTier2Pct,
+  };
+  return new ExecutionCostCalculator(costConfig);
+}
+
+function buildRegimeClassifier(botConfig: BotConfig): RegimeClassifier {
+  const regimeConfig: RegimeConfig = {
+    chaosVolatilityThreshold: botConfig.chaosVolatilityThreshold,
+    chopRangeThreshold: botConfig.chopRangeThreshold,
+    minSamplesForClassification: 3,
+    fastCycleThresholdMinutes: 30,
+    slowCycleThresholdMinutes: 180,
+  };
+  return new RegimeClassifier(regimeConfig);
+}
+
+function buildSplitExecutor(botConfig: BotConfig): SplitExecutor {
+  return new SplitExecutor({
+    costConfig: {
+      estimatedDexFeePct: botConfig.estimatedDexFeePct,
+      priorityFeeImpactPct: botConfig.priorityFeeImpactPct,
+      minimumNetEdgePct: botConfig.minimumNetEdgePct,
+      maxExecutionCostPct: botConfig.maxExecutionCostPct,
+      baseSellTargetPct: botConfig.sellRisePct,
+      sellTargetTier1Pct: botConfig.sellTargetTier1Pct,
+      sellTargetTier2Pct: botConfig.sellTargetTier2Pct,
+    },
+    tierConfig: {
+      tier1Usdc: botConfig.capitalTier1Usdc,
+      tier2Usdc: botConfig.capitalTier2Usdc,
+      tier3Usdc: botConfig.capitalTier3Usdc,
+    },
+    splitConfig: {
+      maxSingleTradeSlippagePct: botConfig.maxSingleTradeSlippagePct,
+      targetChunkSlippagePct: botConfig.targetChunkSlippagePct,
+      minChunkSizeUsdc: botConfig.minChunkSizeUsdc,
+      maxChunksPerSplit: botConfig.maxChunksPerSplit,
+    },
+    delayBetweenChunksMs: 2000,
+    maxChunkRetries: 2,
+    quoteRefreshBeforeEachChunk: true,
+    abortOnSlippageSpike: true,
+    slippageSpikeThresholdBps: 200,
+    abortOnPriceMove: true,
+    priceMoveAbortThresholdPct: 2.0,
+  });
+}
+
 function buildStrategyConfig(botConfig: BotConfig): StrategyConfig {
   return {
     buyDipPct: botConfig.buyDipPct,
@@ -607,4 +1285,967 @@ async function buildStrategyState(instance: BotInstance): Promise<StrategyState>
     totalBaseCost: instance.totalBaseCost,
     totalBaseQty: instance.totalBaseQty,
   };
+}
+
+/**
+ * Apply regime-based adjustments to bot config
+ */
+function applyRegimeAdjustments(
+  botConfig: BotConfig,
+  regime: MarketRegime
+): BotConfig {
+  // For now, return config as-is - regime adjustments are handled by the classifier's recommendation
+  // In a more sophisticated implementation, we could clone and modify the config here
+  return botConfig;
+}
+
+// === SCALE-OUT EXIT FUNCTIONS ===
+
+/**
+ * Build ScaleOutManager from bot config
+ */
+function buildScaleOutManager(
+  botConfig: BotConfig,
+  costCalculator: ExecutionCostCalculator
+): ScaleOutManager {
+  const scaleOutConfig: ScaleOutConfig = {
+    exitMode: botConfig.exitMode as 'FULL_EXIT' | 'SCALE_OUT',
+    primaryPct: botConfig.scaleOutPrimaryPct,
+    secondaryPct: botConfig.scaleOutSecondaryPct,
+    secondaryTargetPct: botConfig.scaleOutSecondaryTargetPct,
+    trailingEnabled: botConfig.scaleOutTrailingEnabled,
+    minExtensionPct: botConfig.scaleOutMinExtensionPct,
+    minDollarProfit: botConfig.scaleOutMinDollarProfit,
+    trailingStopPct: botConfig.scaleOutTrailingStopPct,
+    allowWhale: botConfig.scaleOutAllowWhale,
+  };
+
+  return new ScaleOutManager(scaleOutConfig, {
+    estimatedDexFeePct: botConfig.estimatedDexFeePct,
+    priorityFeeImpactPct: botConfig.priorityFeeImpactPct,
+    minimumNetEdgePct: botConfig.minimumNetEdgePct,
+    maxExecutionCostPct: botConfig.maxExecutionCostPct,
+    baseSellTargetPct: botConfig.sellRisePct,
+    sellTargetTier1Pct: botConfig.sellTargetTier1Pct,
+    sellTargetTier2Pct: botConfig.sellTargetTier2Pct,
+  });
+}
+
+/**
+ * Build extension state data from instance
+ */
+function buildExtensionStateData(instance: BotInstance): ExtensionStateData {
+  return {
+    state: instance.extensionState as 'NONE' | 'ACTIVE' | 'TRAILING',
+    baseQty: instance.extensionBaseQty,
+    baseCost: instance.extensionBaseCost,
+    entryPrice: instance.extensionEntryPrice,
+    peakPrice: instance.extensionPeakPrice,
+    startedAt: instance.extensionStartedAt,
+    primaryPnl: instance.extensionPrimaryPnl,
+  };
+}
+
+/**
+ * Execute sell with scale-out logic
+ */
+async function executeSellWithScaleOut(
+  instanceId: string,
+  action: StrategyAction & { type: 'SELL' },
+  instance: BotInstance,
+  adapter: ChainAdapter,
+  botConfig: BotConfig,
+  pnlCalculator: PnLCalculator,
+  costCalculator: ExecutionCostCalculator,
+  currentPrice: number,
+  portfolioValueUsdc: number,
+  currentRegime: MarketRegime,
+  quote: QuoteResult
+): Promise<void> {
+  const scaleOutManager = buildScaleOutManager(botConfig, costCalculator);
+
+  // Evaluate capital tier
+  const tierEvaluator = new CapitalTierEvaluator(
+    {
+      tier1Usdc: botConfig.capitalTier1Usdc,
+      tier2Usdc: botConfig.capitalTier2Usdc,
+      tier3Usdc: botConfig.capitalTier3Usdc,
+    },
+    {
+      maxSingleTradeSlippagePct: botConfig.maxSingleTradeSlippagePct,
+      targetChunkSlippagePct: botConfig.targetChunkSlippagePct,
+      minChunkSizeUsdc: botConfig.minChunkSizeUsdc,
+      maxChunksPerSplit: botConfig.maxChunksPerSplit,
+    }
+  );
+  const tierResult = tierEvaluator.evaluate(portfolioValueUsdc, instance.totalBaseCost);
+
+  // Check scale-out eligibility
+  const scaleOutCheck = scaleOutManager.isScaleOutAllowed(
+    currentRegime as 'UNKNOWN' | 'TREND' | 'CHOP' | 'CHAOS',
+    tierResult.tier
+  );
+
+  // Calculate execution cost for net edge
+  const costResult = costCalculator.calculateExecutionCost(quote);
+
+  // Evaluate scale-out decision
+  const extensionState = buildExtensionStateData(instance);
+  const scaleOutDecision = scaleOutManager.evaluateSellDecision(
+    instance.totalBaseQty,
+    instance.totalBaseCost,
+    currentPrice,
+    instance.lastBuyPrice ?? currentPrice,
+    quote,
+    currentRegime as 'UNKNOWN' | 'TREND' | 'CHOP' | 'CHAOS',
+    tierResult.tier,
+    extensionState
+  );
+
+  logger.info('Scale-out decision', {
+    instanceId,
+    exitMode: botConfig.exitMode,
+    regime: currentRegime,
+    capitalTier: tierResult.tier,
+    netEdgePct: costResult.netEdgePct,
+    primaryAllowed: scaleOutCheck.allowed,
+    extensionAllowed: scaleOutCheck.allowed && scaleOutDecision.shouldStartExtension,
+    reason: scaleOutDecision.reason,
+  });
+
+  switch (scaleOutDecision.action) {
+    case 'FULL_EXIT':
+      // Use existing trade execution for full exit
+      await executeTradeWithCostGating(
+        instanceId,
+        action,
+        adapter,
+        botConfig,
+        pnlCalculator,
+        costCalculator,
+        currentPrice,
+        portfolioValueUsdc,
+        currentRegime
+      );
+      break;
+
+    case 'PRIMARY_EXIT':
+      // Execute primary exit and start extension
+      await executePrimaryExit(
+        instanceId,
+        scaleOutDecision,
+        instance,
+        adapter,
+        botConfig,
+        pnlCalculator,
+        costCalculator,
+        currentPrice,
+        portfolioValueUsdc
+      );
+      break;
+
+    case 'HOLD_EXTENSION':
+      // No action - continue holding extension
+      logger.debug('Holding extension', { instanceId, reason: scaleOutDecision.reason });
+      break;
+
+    case 'EXTENSION_EXIT':
+    case 'ABORT_SCALE_OUT':
+      // Exit extension position
+      await executeExtensionExit(
+        instanceId,
+        scaleOutDecision,
+        instance,
+        adapter,
+        botConfig,
+        pnlCalculator,
+        costCalculator,
+        currentPrice,
+        portfolioValueUsdc
+      );
+      break;
+  }
+}
+
+/**
+ * Execute primary exit (65% sell) and start extension for remainder
+ */
+async function executePrimaryExit(
+  instanceId: string,
+  decision: ScaleOutDecision,
+  instance: BotInstance,
+  adapter: ChainAdapter,
+  botConfig: BotConfig,
+  pnlCalculator: PnLCalculator,
+  costCalculator: ExecutionCostCalculator,
+  currentPrice: number,
+  portfolioValueUsdc: number
+): Promise<void> {
+  const side: TradeSide = 'SELL';
+  const clientOrderId = generateClientOrderId(instanceId, side, Date.now());
+
+  // Check for duplicate
+  const existing = await prisma.tradeAttempt.findUnique({
+    where: { clientOrderId },
+  });
+  if (existing) {
+    logger.warn('Duplicate order detected', { clientOrderId });
+    return;
+  }
+
+  // Get quote for primary portion
+  const primaryQuote = await adapter.getQuote({
+    side,
+    amount: decision.sellQty,
+    amountIsBase: true,
+    slippageBps: botConfig.maxSlippageBps,
+    allowedSources: botConfig.allowedSources,
+    excludedSources: botConfig.excludedSources,
+  });
+
+  // Verify execution cost
+  const costResult = costCalculator.calculateExecutionCost(primaryQuote);
+  if (!costResult.shouldExecute) {
+    logger.warn('Primary exit rejected by cost gating', {
+      instanceId,
+      clientOrderId,
+      reason: costResult.rejectionReason,
+    });
+    return;
+  }
+
+  // Create trade attempt
+  const tradeAttempt = await prisma.tradeAttempt.create({
+    data: {
+      instanceId,
+      clientOrderId,
+      side,
+      status: 'PENDING',
+      quotePrice: primaryQuote.price,
+      quotedBaseQty: primaryQuote.inputAmount,
+      quotedQuoteQty: primaryQuote.outputAmount,
+      quotedPriceImpactBps: primaryQuote.priceImpactBps,
+      quotedSlippageBps: botConfig.maxSlippageBps,
+    },
+  });
+
+  // Check dry-run mode
+  if (botConfig.dryRunMode) {
+    logger.info('DRY RUN: Would execute primary exit', {
+      clientOrderId,
+      sellQty: decision.sellQty,
+      extensionQty: decision.extensionQty,
+    });
+
+    await prisma.tradeAttempt.update({
+      where: { id: tradeAttempt.id },
+      data: {
+        status: 'CONFIRMED',
+        errorMessage: 'DRY_RUN_MODE',
+      },
+    });
+
+    // Simulate extension start in dry-run
+    await startExtension(instanceId, decision, currentPrice, 0);
+    return;
+  }
+
+  // Determine if we should split based on capital tier
+  const tierEvaluator = new CapitalTierEvaluator(
+    {
+      tier1Usdc: botConfig.capitalTier1Usdc,
+      tier2Usdc: botConfig.capitalTier2Usdc,
+      tier3Usdc: botConfig.capitalTier3Usdc,
+    },
+    {
+      maxSingleTradeSlippagePct: botConfig.maxSingleTradeSlippagePct,
+      targetChunkSlippagePct: botConfig.targetChunkSlippagePct,
+      minChunkSizeUsdc: botConfig.minChunkSizeUsdc,
+      maxChunksPerSplit: botConfig.maxChunksPerSplit,
+    }
+  );
+
+  const primaryValueUsdc = decision.sellQty * currentPrice;
+  const tierResult = tierEvaluator.evaluate(portfolioValueUsdc, primaryValueUsdc);
+
+  // Execute primary sell
+  await prisma.tradeAttempt.update({
+    where: { id: tradeAttempt.id },
+    data: { status: 'SUBMITTED', submittedAt: new Date() },
+  });
+
+  let primaryFill: FillForPnL;
+
+  if (tierResult.shouldSplit) {
+    // Use split execution for large primary exits
+    logger.info('Using split execution for primary exit', {
+      instanceId,
+      primaryValueUsdc,
+      tier: tierResult.tier,
+    });
+
+    const splitResult = await executeSplitForScaleOut(
+      instanceId,
+      tradeAttempt.id,
+      side,
+      primaryValueUsdc,
+      adapter,
+      botConfig,
+      portfolioValueUsdc,
+      clientOrderId
+    );
+
+    if (!splitResult) {
+      // Split execution failed
+      return;
+    }
+
+    primaryFill = {
+      side,
+      baseQty: splitResult.totalBaseExecuted,
+      quoteQty: splitResult.totalQuoteExecuted,
+      executedPrice: splitResult.weightedAvgPrice || currentPrice,
+      feeQuote: 0,
+      feeNativeUsdc: splitResult.totalFees,
+    };
+  } else {
+    // Single-shot execution
+    const result = await adapter.executeSwap({
+      quote: primaryQuote,
+      clientOrderId,
+    });
+
+    if (!result.success) {
+      await handleTradeFailure(instanceId, tradeAttempt.id, botConfig, result);
+      return;
+    }
+
+    primaryFill = {
+      side,
+      baseQty: result.inputAmount,
+      quoteQty: result.outputAmount,
+      executedPrice: result.executedPrice,
+      feeQuote: 0,
+      feeNativeUsdc: result.feeNativeUsdc,
+    };
+
+    // Update trade attempt status
+    await prisma.tradeAttempt.update({
+      where: { id: tradeAttempt.id },
+      data: {
+        status: 'CONFIRMED',
+        txSignature: result.txSignature,
+        confirmedAt: new Date(),
+      },
+    });
+  }
+
+  // Calculate PnL for primary portion only
+  const costBasisPerUnit = instance.totalBaseCost / instance.totalBaseQty;
+  const primaryPnlResult = pnlCalculator.calculateRealizedPnL(primaryFill, costBasisPerUnit);
+
+  // Record fill (if not already recorded by split execution)
+  if (!tierResult.shouldSplit) {
+    await prisma.tradeFill.create({
+      data: {
+        attemptId: tradeAttempt.id,
+        side,
+        baseQty: primaryFill.baseQty,
+        quoteQty: primaryFill.quoteQty,
+        executedPrice: primaryFill.executedPrice,
+        feeQuote: 0,
+        feeNative: 0,
+        feeNativeUsdc: primaryFill.feeNativeUsdc,
+        actualSlippageBps: null,
+        costBasisPerUnit,
+        realizedPnl: primaryPnlResult.realizedPnl,
+        txSignature: 'SCALE_OUT_PRIMARY',
+        executedAt: new Date(),
+      },
+    });
+  }
+
+  // Update instance - primary portion sold, extension started
+  await updateInstanceAfterPrimaryExit(
+    instanceId,
+    primaryFill,
+    primaryPnlResult.realizedPnl,
+    instance
+  );
+
+  // Start extension with remaining portion
+  await startExtension(instanceId, decision, currentPrice, primaryPnlResult.realizedPnl);
+
+  // Send alert
+  const alertService = new AlertService(
+    botConfig.webhookUrl ?? config.alerts.webhookUrl,
+    botConfig.discordWebhookUrl ?? config.alerts.discordWebhookUrl
+  );
+  await alertService.sendAlert({
+    instanceId,
+    type: 'TRADE_EXECUTED',
+    title: 'Primary Exit (Scale-Out)',
+    message: `Sold ${primaryFill.baseQty.toFixed(4)} @ ${primaryFill.executedPrice.toFixed(4)} USDC. Extension started with ${decision.extensionQty.toFixed(4)} remaining.`,
+    metadata: {
+      side,
+      primaryQty: primaryFill.baseQty,
+      extensionQty: decision.extensionQty,
+      price: primaryFill.executedPrice,
+      realizedPnl: primaryPnlResult.realizedPnl,
+      splitExecution: tierResult.shouldSplit,
+    },
+  });
+
+  logger.info('Primary exit executed, extension started', {
+    instanceId,
+    primaryQty: primaryFill.baseQty,
+    primaryPnl: primaryPnlResult.realizedPnl,
+    extensionQty: decision.extensionQty,
+    extensionCost: decision.extensionCost,
+    splitExecution: tierResult.shouldSplit,
+  });
+}
+
+/**
+ * Execute extension exit (remaining 35% or forced exit)
+ */
+async function executeExtensionExit(
+  instanceId: string,
+  decision: ScaleOutDecision,
+  instance: BotInstance,
+  adapter: ChainAdapter,
+  botConfig: BotConfig,
+  pnlCalculator: PnLCalculator,
+  costCalculator: ExecutionCostCalculator,
+  currentPrice: number,
+  portfolioValueUsdc: number
+): Promise<void> {
+  const side: TradeSide = 'SELL';
+  const clientOrderId = generateClientOrderId(instanceId, side, Date.now());
+
+  // Check for duplicate
+  const existing = await prisma.tradeAttempt.findUnique({
+    where: { clientOrderId },
+  });
+  if (existing) {
+    logger.warn('Duplicate order detected', { clientOrderId });
+    return;
+  }
+
+  // Get quote for extension portion
+  const extensionQuote = await adapter.getQuote({
+    side,
+    amount: instance.extensionBaseQty,
+    amountIsBase: true,
+    slippageBps: botConfig.maxSlippageBps,
+    allowedSources: botConfig.allowedSources,
+    excludedSources: botConfig.excludedSources,
+  });
+
+  // Create trade attempt
+  const tradeAttempt = await prisma.tradeAttempt.create({
+    data: {
+      instanceId,
+      clientOrderId,
+      side,
+      status: 'PENDING',
+      quotePrice: extensionQuote.price,
+      quotedBaseQty: extensionQuote.inputAmount,
+      quotedQuoteQty: extensionQuote.outputAmount,
+      quotedPriceImpactBps: extensionQuote.priceImpactBps,
+      quotedSlippageBps: botConfig.maxSlippageBps,
+    },
+  });
+
+  // Check dry-run mode
+  if (botConfig.dryRunMode) {
+    logger.info('DRY RUN: Would execute extension exit', {
+      clientOrderId,
+      extensionQty: instance.extensionBaseQty,
+      reason: decision.reason,
+    });
+
+    await prisma.tradeAttempt.update({
+      where: { id: tradeAttempt.id },
+      data: {
+        status: 'CONFIRMED',
+        errorMessage: 'DRY_RUN_MODE',
+      },
+    });
+
+    // Clear extension state in dry-run
+    await clearExtension(instanceId, 0);
+    return;
+  }
+
+  // Execute extension sell
+  await prisma.tradeAttempt.update({
+    where: { id: tradeAttempt.id },
+    data: { status: 'SUBMITTED', submittedAt: new Date() },
+  });
+
+  const result = await adapter.executeSwap({
+    quote: extensionQuote,
+    clientOrderId,
+  });
+
+  if (!result.success) {
+    await handleTradeFailure(instanceId, tradeAttempt.id, botConfig, result);
+    // Keep extension state on failure - will retry next cycle
+    return;
+  }
+
+  // Process extension fill
+  const extensionFill: FillForPnL = {
+    side,
+    baseQty: result.inputAmount,
+    quoteQty: result.outputAmount,
+    executedPrice: result.executedPrice,
+    feeQuote: 0,
+    feeNativeUsdc: result.feeNativeUsdc,
+  };
+
+  // Calculate PnL for extension portion
+  const costBasisPerUnit = instance.extensionBaseCost / instance.extensionBaseQty;
+  const extensionPnlResult = pnlCalculator.calculateRealizedPnL(extensionFill, costBasisPerUnit);
+
+  // Record fill
+  await prisma.tradeFill.create({
+    data: {
+      attemptId: tradeAttempt.id,
+      side,
+      baseQty: extensionFill.baseQty,
+      quoteQty: extensionFill.quoteQty,
+      executedPrice: result.executedPrice,
+      feeQuote: 0,
+      feeNative: result.feeNative,
+      feeNativeUsdc: result.feeNativeUsdc,
+      actualSlippageBps: result.actualSlippageBps,
+      costBasisPerUnit,
+      realizedPnl: extensionPnlResult.realizedPnl,
+      txSignature: result.txSignature,
+      blockNumber: result.blockNumber,
+      slot: result.slot,
+      executedAt: new Date(),
+    },
+  });
+
+  await prisma.tradeAttempt.update({
+    where: { id: tradeAttempt.id },
+    data: {
+      status: 'CONFIRMED',
+      txSignature: result.txSignature,
+      confirmedAt: new Date(),
+    },
+  });
+
+  // Clear extension state and finalize
+  await clearExtension(instanceId, extensionPnlResult.realizedPnl);
+
+  // Send alert
+  const alertService = new AlertService(
+    botConfig.webhookUrl ?? config.alerts.webhookUrl,
+    botConfig.discordWebhookUrl ?? config.alerts.discordWebhookUrl
+  );
+
+  const totalCyclePnl = instance.extensionPrimaryPnl + extensionPnlResult.realizedPnl;
+
+  await alertService.sendAlert({
+    instanceId,
+    type: 'TRADE_EXECUTED',
+    title: 'Extension Exit (Scale-Out Complete)',
+    message: `Extension sold ${extensionFill.baseQty.toFixed(4)} @ ${result.executedPrice.toFixed(4)} USDC. Total cycle PnL: $${totalCyclePnl.toFixed(2)}`,
+    metadata: {
+      side,
+      extensionQty: extensionFill.baseQty,
+      price: result.executedPrice,
+      txSignature: result.txSignature,
+      extensionPnl: extensionPnlResult.realizedPnl,
+      primaryPnl: instance.extensionPrimaryPnl,
+      totalCyclePnl,
+      exitReason: decision.reason,
+    },
+  });
+
+  logger.info('Extension exit executed, scale-out complete', {
+    instanceId,
+    extensionQty: extensionFill.baseQty,
+    extensionPnl: extensionPnlResult.realizedPnl,
+    primaryPnl: instance.extensionPrimaryPnl,
+    totalCyclePnl,
+    exitReason: decision.reason,
+  });
+}
+
+/**
+ * Execute split trade for scale-out (returns result or null on failure)
+ */
+async function executeSplitForScaleOut(
+  instanceId: string,
+  tradeAttemptId: string,
+  side: TradeSide,
+  totalAmountUsdc: number,
+  adapter: ChainAdapter,
+  botConfig: BotConfig,
+  portfolioValueUsdc: number,
+  clientOrderId: string
+): Promise<SplitExecutionResult | null> {
+  const splitExecutor = buildSplitExecutor(botConfig);
+
+  const splitResult = await splitExecutor.execute(
+    adapter,
+    side,
+    totalAmountUsdc,
+    portfolioValueUsdc,
+    botConfig.maxSlippageBps,
+    clientOrderId,
+    botConfig.allowedSources,
+    botConfig.excludedSources
+  );
+
+  // Record split execution
+  const splitExecution = await prisma.splitExecution.create({
+    data: {
+      instanceId,
+      parentOrderId: clientOrderId,
+      side,
+      totalIntendedSize: totalAmountUsdc,
+      totalChunks: splitResult.totalChunks,
+      completedChunks: splitResult.completedChunks,
+      abortedChunks: splitResult.abortedChunks,
+      totalBaseExecuted: splitResult.totalBaseExecuted,
+      totalQuoteExecuted: splitResult.totalQuoteExecuted,
+      weightedAvgPrice: splitResult.weightedAvgPrice,
+      totalFees: splitResult.totalFees,
+      totalSlippageCost: splitResult.totalSlippageCost,
+      status: splitResult.success ? 'CONFIRMED' : 'FAILED',
+      abortReason: splitResult.abortReason,
+      startedAt: splitResult.startedAt,
+      completedAt: splitResult.completedAt,
+    },
+  });
+
+  // Record individual chunks
+  for (const chunk of splitResult.chunks) {
+    await prisma.splitChunk.create({
+      data: {
+        splitExecutionId: splitExecution.id,
+        chunkIndex: chunk.chunkIndex,
+        intendedSize: totalAmountUsdc / splitResult.totalChunks,
+        quotedPrice: chunk.quote?.price,
+        quotedSlippageBps: chunk.quote?.priceImpactBps,
+        status: chunk.success ? 'CONFIRMED' : 'FAILED',
+        executedBaseQty: chunk.executedBaseQty || null,
+        executedQuoteQty: chunk.executedQuoteQty || null,
+        executedPrice: chunk.executedPrice || null,
+        actualSlippageBps: chunk.actualSlippageBps,
+        feeNativeUsdc: chunk.feeNativeUsdc || null,
+        txSignature: chunk.swap?.txSignature,
+        errorMessage: chunk.error,
+        attemptedAt: chunk.attemptedAt,
+        completedAt: chunk.completedAt,
+      },
+    });
+  }
+
+  if (!splitResult.success && splitResult.completedChunks === 0) {
+    // Complete failure
+    await prisma.tradeAttempt.update({
+      where: { id: tradeAttemptId },
+      data: {
+        status: 'FAILED',
+        errorCode: 'SPLIT_EXECUTION_FAILED',
+        errorMessage: splitResult.abortReason,
+      },
+    });
+
+    await prisma.botInstance.update({
+      where: { id: instanceId },
+      data: {
+        consecutiveFailures: { increment: 1 },
+        lastError: splitResult.abortReason,
+        lastErrorAt: new Date(),
+      },
+    });
+
+    const alertService = new AlertService(
+      botConfig.webhookUrl ?? config.alerts.webhookUrl,
+      botConfig.discordWebhookUrl ?? config.alerts.discordWebhookUrl
+    );
+    await alertService.sendAlert({
+      instanceId,
+      type: 'TRADE_FAILED',
+      title: 'Scale-Out Split Trade Failed',
+      message: `${side} split trade failed: ${splitResult.abortReason}`,
+      metadata: { clientOrderId, side, chunks: splitResult.totalChunks },
+    });
+
+    return null;
+  }
+
+  // Update trade attempt for partial or full success
+  await prisma.tradeAttempt.update({
+    where: { id: tradeAttemptId },
+    data: {
+      status: 'CONFIRMED',
+      confirmedAt: new Date(),
+      errorMessage: splitResult.abortReason ? `Partial: ${splitResult.abortReason}` : null,
+    },
+  });
+
+  return splitResult;
+}
+
+/**
+ * Check if extension should exit (called each cycle when in extension state)
+ */
+async function checkExtensionExit(
+  instanceId: string,
+  instance: BotInstance,
+  adapter: ChainAdapter,
+  botConfig: BotConfig,
+  pnlCalculator: PnLCalculator,
+  costCalculator: ExecutionCostCalculator,
+  currentPrice: number,
+  portfolioValueUsdc: number,
+  currentRegime: MarketRegime,
+  quote: QuoteResult
+): Promise<boolean> {
+  const scaleOutManager = buildScaleOutManager(botConfig, costCalculator);
+
+  // Evaluate capital tier
+  const tierEvaluator = new CapitalTierEvaluator(
+    {
+      tier1Usdc: botConfig.capitalTier1Usdc,
+      tier2Usdc: botConfig.capitalTier2Usdc,
+      tier3Usdc: botConfig.capitalTier3Usdc,
+    },
+    {
+      maxSingleTradeSlippagePct: botConfig.maxSingleTradeSlippagePct,
+      targetChunkSlippagePct: botConfig.targetChunkSlippagePct,
+      minChunkSizeUsdc: botConfig.minChunkSizeUsdc,
+      maxChunksPerSplit: botConfig.maxChunksPerSplit,
+    }
+  );
+  const tierResult = tierEvaluator.evaluate(portfolioValueUsdc, instance.extensionBaseCost);
+
+  // Build extension state
+  const extensionState = buildExtensionStateData(instance);
+
+  // Evaluate using scale-out manager
+  const decision = scaleOutManager.evaluateSellDecision(
+    instance.extensionBaseQty,
+    instance.extensionBaseCost,
+    currentPrice,
+    instance.extensionEntryPrice ?? currentPrice,
+    quote,
+    currentRegime as 'UNKNOWN' | 'TREND' | 'CHOP' | 'CHAOS',
+    tierResult.tier,
+    extensionState
+  );
+
+  logger.debug('Extension check', {
+    instanceId,
+    action: decision.action,
+    reason: decision.reason,
+  });
+
+  if (decision.action === 'EXTENSION_EXIT' || decision.action === 'ABORT_SCALE_OUT') {
+    await executeExtensionExit(
+      instanceId,
+      decision,
+      instance,
+      adapter,
+      botConfig,
+      pnlCalculator,
+      costCalculator,
+      currentPrice,
+      portfolioValueUsdc
+    );
+    return true;
+  }
+
+  return false; // Hold extension
+}
+
+/**
+ * Force extension exit (e.g., for CHAOS regime)
+ */
+async function forceExtensionExit(
+  instanceId: string,
+  instance: BotInstance,
+  adapter: ChainAdapter,
+  botConfig: BotConfig,
+  pnlCalculator: PnLCalculator,
+  currentPrice: number,
+  reason: string
+): Promise<void> {
+  logger.warn('Forcing extension exit', { instanceId, reason });
+
+  const costCalculator = buildCostCalculator(botConfig);
+
+  const forcedDecision: ScaleOutDecision = {
+    action: 'ABORT_SCALE_OUT',
+    sellQty: instance.extensionBaseQty,
+    reason: `Forced: ${reason}`,
+    expectedPnl: 0, // Will be calculated during execution
+    isExtensionExit: true,
+    shouldStartExtension: false,
+    extensionQty: 0,
+    extensionCost: 0,
+  };
+
+  await executeExtensionExit(
+    instanceId,
+    forcedDecision,
+    instance,
+    adapter,
+    botConfig,
+    pnlCalculator,
+    costCalculator,
+    currentPrice,
+    0 // portfolio value not critical for forced exit
+  );
+}
+
+/**
+ * Update peak price for trailing stop
+ */
+async function updateExtensionPeakPrice(
+  instanceId: string,
+  instance: BotInstance,
+  currentPrice: number
+): Promise<void> {
+  if (instance.extensionState === 'NONE') return;
+
+  const newPeak = Math.max(instance.extensionPeakPrice ?? 0, currentPrice);
+
+  if (newPeak > (instance.extensionPeakPrice ?? 0)) {
+    await prisma.botInstance.update({
+      where: { id: instanceId },
+      data: { extensionPeakPrice: newPeak },
+    });
+
+    logger.debug('Extension peak updated', {
+      instanceId,
+      oldPeak: instance.extensionPeakPrice,
+      newPeak,
+    });
+  }
+}
+
+/**
+ * Start extension after primary exit
+ */
+async function startExtension(
+  instanceId: string,
+  decision: ScaleOutDecision,
+  entryPrice: number,
+  primaryPnl: number
+): Promise<void> {
+  await prisma.botInstance.update({
+    where: { id: instanceId },
+    data: {
+      extensionState: 'ACTIVE',
+      extensionBaseQty: decision.extensionQty,
+      extensionBaseCost: decision.extensionCost,
+      extensionEntryPrice: entryPrice,
+      extensionPeakPrice: entryPrice,
+      extensionStartedAt: new Date(),
+      extensionPrimaryPnl: primaryPnl,
+    },
+  });
+
+  logger.info('Extension started', {
+    instanceId,
+    qty: decision.extensionQty,
+    cost: decision.extensionCost,
+    entryPrice,
+    primaryPnl,
+  });
+}
+
+/**
+ * Clear extension state after exit
+ */
+async function clearExtension(
+  instanceId: string,
+  extensionPnl: number
+): Promise<void> {
+  // Get current instance to calculate total PnL
+  const instance = await prisma.botInstance.findUnique({
+    where: { id: instanceId },
+  });
+
+  const totalPnl = (instance?.extensionPrimaryPnl ?? 0) + extensionPnl;
+
+  await prisma.botInstance.update({
+    where: { id: instanceId },
+    data: {
+      extensionState: 'NONE',
+      extensionBaseQty: 0,
+      extensionBaseCost: 0,
+      extensionEntryPrice: null,
+      extensionPeakPrice: null,
+      extensionStartedAt: null,
+      extensionPrimaryPnl: 0,
+      // Update total position to zero after scale-out complete
+      totalBaseQty: 0,
+      totalBaseCost: 0,
+      // Add extension PnL to daily realized
+      dailyRealizedPnl: { increment: extensionPnl },
+    },
+  });
+
+  logger.info('Extension cleared', {
+    instanceId,
+    extensionPnl,
+    totalCyclePnl: totalPnl,
+  });
+}
+
+/**
+ * Update instance after primary exit (partial sell)
+ */
+async function updateInstanceAfterPrimaryExit(
+  instanceId: string,
+  fill: FillForPnL,
+  realizedPnl: number,
+  instance: BotInstance
+): Promise<void> {
+  const now = new Date();
+
+  // Calculate remaining position after primary sell
+  const remainingQty = instance.totalBaseQty - fill.baseQty;
+  const remainingCost = instance.totalBaseCost * (remainingQty / instance.totalBaseQty);
+
+  const updateData: Record<string, unknown> = {
+    lastTradeAt: now,
+    lastSellPrice: fill.executedPrice,
+    consecutiveFailures: 0,
+    tradesThisHour: { increment: 1 },
+    totalSells: { increment: 1 },
+    totalSellVolume: { increment: fill.quoteQty },
+    dailyRealizedPnl: { increment: realizedPnl },
+    // Update to remaining position (extension portion)
+    totalBaseQty: remainingQty,
+    totalBaseCost: remainingCost,
+  };
+
+  // Reset hourly counter if needed
+  if (!isSameHour(instance.hourlyResetAt, now)) {
+    updateData.tradesThisHour = 1;
+    updateData.hourlyResetAt = now;
+  }
+
+  // Reset daily PnL if needed
+  if (!isSameDay(instance.dailyResetAt, now)) {
+    updateData.dailyRealizedPnl = realizedPnl;
+    updateData.dailyResetAt = now;
+  }
+
+  await prisma.botInstance.update({
+    where: { id: instanceId },
+    data: updateData,
+  });
 }
