@@ -27,7 +27,8 @@
     "@typescript-eslint/parser": "^6.15.0",
     "eslint-config-prettier": "^9.1.0",
     "tsx": "^4.7.0",
-    "vitest": "^1.1.0"
+    "vitest": "^1.1.0",
+    "next": "^14.0.4"
   },
   "pnpm": {
     "overrides": {}
