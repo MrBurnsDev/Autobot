@@ -30,6 +30,26 @@ export interface BotConfig {
   dryRunMode: boolean;
   webhookUrl: string | null;
   discordWebhookUrl: string | null;
+  // Compounding configuration
+  compoundingMode: 'FIXED' | 'FULL_BALANCE' | 'CALCULATED';
+  initialTradeSizeUsdc: number | null;
+  compoundingReservePct: number;
+  // Multi-step scale-out configuration
+  scaleOutSteps: number;
+  scaleOutRangePct: number;
+  scaleOutSpacingPct: number | null;
+  // Exit mode configuration
+  exitMode: 'FULL_EXIT' | 'SCALE_OUT';
+  scaleOutPrimaryPct: number;
+  scaleOutSecondaryPct: number;
+  // Rolling rebuy configuration
+  cycleMode: 'STANDARD' | 'ROLLING_REBUY';
+  primarySellPct: number;
+  allowRebuy: boolean;
+  maxRebuyCount: number;
+  exposureCapPct: number;
+  rebuyRegimeGate: boolean;
+  rebuyDipPct: number | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -93,6 +113,7 @@ export interface Trade {
   clientOrderId: string;
   side: 'BUY' | 'SELL';
   status: 'PENDING' | 'SUBMITTED' | 'CONFIRMED' | 'FAILED' | 'EXPIRED';
+  isDryRun: boolean;
   quotePrice: number;
   quotedBaseQty: number;
   quotedQuoteQty: number;
@@ -165,11 +186,18 @@ export const configApi = {
     }),
 };
 
+export interface PriceHistory {
+  chain: 'SOLANA' | 'AVALANCHE';
+  pair: string;
+  prices: { timestamp: number; price: number }[];
+}
+
 // Bot API
 export const botApi = {
   list: () => fetchApi<BotInstance[]>('/api/bots'),
   get: (id: string) => fetchApi<BotInstance>(`/api/bots/${id}`),
   getStatus: (id: string) => fetchApi<BotStatus>(`/api/bots/${id}/status`),
+  getPrices: (id: string) => fetchApi<PriceHistory>(`/api/bots/${id}/prices`),
   create: (configId: string) =>
     fetchApi<BotInstance>('/api/bots', {
       method: 'POST',
@@ -182,6 +210,11 @@ export const botApi = {
   stop: (id: string) =>
     fetchApi<BotInstance>(`/api/bots/${id}/stop`, {
       method: 'POST',
+    }),
+  trade: (id: string, side: 'BUY' | 'SELL') =>
+    fetchApi<{ success: boolean; message: string; tradeId?: string }>(`/api/bots/${id}/trade`, {
+      method: 'POST',
+      body: JSON.stringify({ side }),
     }),
   delete: (id: string) =>
     fetchApi<void>(`/api/bots/${id}`, {

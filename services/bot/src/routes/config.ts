@@ -32,6 +32,26 @@ const CreateConfigSchema = z.object({
   dryRunMode: z.boolean().default(false),
   webhookUrl: z.string().url().nullable().optional(),
   discordWebhookUrl: z.string().url().nullable().optional(),
+  // Compounding settings
+  compoundingMode: z.enum(['FIXED', 'FULL_BALANCE', 'CALCULATED']).default('FIXED'),
+  initialTradeSizeUsdc: z.number().positive().nullable().optional(),
+  compoundingReservePct: z.number().min(0).max(50).default(5),
+  // Multi-step scale-out settings
+  scaleOutSteps: z.number().int().min(1).max(10).default(1),
+  scaleOutRangePct: z.number().min(0.1).max(10).default(2),
+  scaleOutSpacingPct: z.number().min(0.1).max(5).nullable().optional(),
+  // Exit mode settings
+  exitMode: z.enum(['FULL_EXIT', 'SCALE_OUT']).default('FULL_EXIT'),
+  scaleOutPrimaryPct: z.number().min(0.1).max(1).default(0.65),
+  scaleOutSecondaryPct: z.number().min(0.1).max(1).default(0.35),
+  // Rolling rebuy settings
+  cycleMode: z.enum(['STANDARD', 'ROLLING_REBUY']).default('STANDARD'),
+  primarySellPct: z.number().min(50).max(100).default(80),
+  allowRebuy: z.boolean().default(false),
+  maxRebuyCount: z.number().int().min(1).max(5).default(1),
+  exposureCapPct: z.number().min(20).max(100).default(50),
+  rebuyRegimeGate: z.boolean().default(true),
+  rebuyDipPct: z.number().min(0.1).max(50).nullable().optional(),
 });
 
 const UpdateConfigSchema = CreateConfigSchema.partial();
@@ -105,20 +125,10 @@ export const configRoutes: FastifyPluginAsync = async (fastify) => {
 
       const existing = await prisma.botConfig.findUnique({
         where: { id: request.params.id },
-        include: {
-          instances: {
-            where: { status: 'RUNNING' },
-          },
-        },
       });
 
       if (!existing) {
         return reply.notFound('Config not found');
-      }
-
-      // Don't allow editing while running
-      if (existing.instances.length > 0) {
-        return reply.badRequest('Cannot edit config while bot is running');
       }
 
       const config = await prisma.botConfig.update({

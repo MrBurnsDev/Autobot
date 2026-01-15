@@ -19,6 +19,7 @@ COPY apps/dashboard/ ./apps/dashboard/
 # Build
 ENV NEXT_TELEMETRY_DISABLED=1
 ENV NEXT_PUBLIC_API_URL=http://localhost:3001
+ENV DOCKER_BUILD=1
 RUN pnpm --filter @autobot/dashboard build
 
 # Production stage

@@ -50,4 +50,15 @@ export {
   type ExtensionStateData,
   type ScaleOutDecision,
   type ExtensionExitDecision,
+  type ScaleOutLevel,
 } from './scale-out-manager.js';
+
+// Compounding calculator for dynamic trade sizing
+export {
+  CompoundingCalculator,
+  formatCompoundingLog,
+  DEFAULT_COMPOUNDING_CONFIG,
+  type CompoundingMode,
+  type CompoundingConfig,
+  type TradeSizeResult,
+} from './compounding-calculator.js';

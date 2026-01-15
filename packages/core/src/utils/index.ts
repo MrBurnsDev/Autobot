@@ -26,6 +26,14 @@ export function safeSubtract(a: number, b: number): number {
   return new Decimal(a).sub(b).toNumber();
 }
 
+export function safeMax(a: number, b: number): number {
+  return Decimal.max(a, b).toNumber();
+}
+
+export function safeMin(a: number, b: number): number {
+  return Decimal.min(a, b).toNumber();
+}
+
 /**
  * Convert basis points to decimal multiplier
  * e.g., 50 bps = 0.005 = 0.5%

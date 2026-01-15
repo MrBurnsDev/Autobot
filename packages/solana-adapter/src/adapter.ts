@@ -70,7 +70,7 @@ export class SolanaAdapter implements ChainAdapter {
     const secretKey = bs58.decode(config.privateKeyBase58);
     this.keypair = Keypair.fromSecretKey(secretKey);
 
-    this.jupiterClient = new JupiterClient(config.jupiterApiBase);
+    this.jupiterClient = new JupiterClient(config.jupiterApiBase, config.jupiterApiKey);
     this.priorityFeeMicroLamports =
       config.priorityFeeMicroLamports ?? DEFAULT_COMPUTE_UNIT_PRICE_MICRO_LAMPORTS;
     this.confirmationCommitment = config.confirmationCommitment ?? 'confirmed';

@@ -2,7 +2,7 @@ import { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 import { prisma } from '@autobot/db';
 import { PnLCalculator, Logger } from '@autobot/core';
-import { startWorker, stopWorker, isWorkerRunning } from '../workers/trading-worker.js';
+import { startWorker, stopWorker, isWorkerRunning, getPriceHistory, executeManualTrade } from '../workers/trading-worker.js';
 import { getAdapter } from '../services/adapter-factory.js';
 
 const logger = new Logger('BotRoutes');
@@ -96,8 +96,9 @@ export const botRoutes: FastifyPluginAsync = async (fastify) => {
       return reply.notFound('Bot instance not found');
     }
 
-    if (instance.status === 'RUNNING') {
-      return reply.badRequest('Bot is already running');
+    if (instance.status === 'RUNNING' && isWorkerRunning(instance.id)) {
+      // Return success for idempotency - already in desired state
+      return instance;
     }
 
     // Check connectivity before starting
@@ -133,11 +134,27 @@ export const botRoutes: FastifyPluginAsync = async (fastify) => {
       return reply.notFound('Bot instance not found');
     }
 
-    if (instance.status !== 'RUNNING') {
-      return reply.badRequest('Bot is not running');
+    // Check if already stopped (both DB status and worker)
+    const workerRunning = isWorkerRunning(instance.id);
+    if (instance.status === 'STOPPED' && !workerRunning) {
+      // Return success for idempotency - already in desired state
+      return instance;
     }
 
-    await stopWorker(instance.id, 'Stopped by user');
+    // Stop the worker if it's running
+    if (workerRunning) {
+      await stopWorker(instance.id, 'Stopped by user');
+    } else {
+      // Worker not running but DB shows RUNNING/PAUSED - sync the state
+      // This can happen after container restart
+      await prisma.botInstance.update({
+        where: { id: instance.id },
+        data: {
+          status: 'STOPPED',
+          pauseReason: 'Stopped by user (state sync)',
+        },
+      });
+    }
 
     const updated = await prisma.botInstance.findUnique({
       where: { id: instance.id },
@@ -221,6 +238,53 @@ export const botRoutes: FastifyPluginAsync = async (fastify) => {
       },
     };
   });
+
+  // Get price history for live chart
+  fastify.get<{ Params: { id: string } }>('/bots/:id/prices', async (request, reply) => {
+    const instance = await prisma.botInstance.findUnique({
+      where: { id: request.params.id },
+      select: { id: true, config: { select: { chain: true } } },
+    });
+
+    if (!instance) {
+      return reply.notFound('Bot instance not found');
+    }
+
+    const history = getPriceHistory(instance.id);
+    return {
+      chain: instance.config.chain,
+      pair: instance.config.chain === 'SOLANA' ? 'SOL/USDC' : 'AVAX/USDC',
+      prices: history,
+    };
+  });
+
+  // Manual trade execution (for testing)
+  fastify.post<{ Params: { id: string }; Body: { side: 'BUY' | 'SELL' } }>(
+    '/bots/:id/trade',
+    async (request, reply) => {
+      const { side } = request.body;
+
+      if (!side || !['BUY', 'SELL'].includes(side)) {
+        return reply.badRequest('Invalid side. Must be BUY or SELL');
+      }
+
+      const instance = await prisma.botInstance.findUnique({
+        where: { id: request.params.id },
+      });
+
+      if (!instance) {
+        return reply.notFound('Bot instance not found');
+      }
+
+      const result = await executeManualTrade(instance.id, side);
+
+      if (!result.success) {
+        return reply.badRequest(result.message);
+      }
+
+      return result;
+    }
+  );
 
   // Delete bot instance
   fastify.delete<{ Params: { id: string } }>('/bots/:id', async (request, reply) => {

@@ -2,6 +2,15 @@ import { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 import { prisma } from '@autobot/db';
 
+// Helper to convert BigInt fields to strings for JSON serialization
+function serializeBigInt<T>(obj: T): T {
+  return JSON.parse(
+    JSON.stringify(obj, (_, value) =>
+      typeof value === 'bigint' ? value.toString() : value
+    )
+  );
+}
+
 const TradesQuerySchema = z.object({
   instanceId: z.string().optional(),
   side: z.enum(['BUY', 'SELL']).optional(),
@@ -44,7 +53,7 @@ export const tradesRoutes: FastifyPluginAsync = async (fastify) => {
     ]);
 
     return {
-      trades,
+      trades: serializeBigInt(trades),
       pagination: {
         total,
         limit: query.limit,
@@ -70,7 +79,7 @@ export const tradesRoutes: FastifyPluginAsync = async (fastify) => {
       return reply.notFound('Trade not found');
     }
 
-    return trade;
+    return serializeBigInt(trade);
   });
 
   // Get trade statistics for an instance

@@ -175,15 +175,22 @@ export default function TradesPage() {
                           {formatDate(trade.createdAt)}
                         </td>
                         <td className="py-3 px-2">
-                          <span
-                            className={`px-2 py-0.5 rounded text-xs font-medium ${
-                              trade.side === 'BUY'
-                                ? 'bg-green-400/20 text-green-400'
-                                : 'bg-red-400/20 text-red-400'
-                            }`}
-                          >
-                            {trade.side}
-                          </span>
+                          <div className="flex items-center gap-1">
+                            <span
+                              className={`px-2 py-0.5 rounded text-xs font-medium ${
+                                trade.side === 'BUY'
+                                  ? 'bg-green-400/20 text-green-400'
+                                  : 'bg-red-400/20 text-red-400'
+                              }`}
+                            >
+                              {trade.side}
+                            </span>
+                            {trade.isDryRun && (
+                              <span className="px-1.5 py-0.5 rounded text-xs bg-yellow-500/20 text-yellow-400">
+                                SIM
+                              </span>
+                            )}
+                          </div>
                         </td>
                         <td className="py-3 px-2">
                           <span className={`text-sm ${getStatusColor(trade.status)}`}>
@@ -216,7 +223,7 @@ export default function TradesPage() {
                           )}
                         </td>
                         <td className="py-3 px-2 text-center">
-                          {trade.fill?.txSignature && (
+                          {trade.fill?.txSignature && !trade.isDryRun ? (
                             <a
                               href={getExplorerUrl(chain, trade.fill.txSignature)}
                               target="_blank"
@@ -225,7 +232,9 @@ export default function TradesPage() {
                             >
                               <ExternalLink className="h-4 w-4 inline" />
                             </a>
-                          )}
+                          ) : trade.isDryRun ? (
+                            <span className="text-xs text-muted-foreground">simulated</span>
+                          ) : null}
                         </td>
                       </tr>
                     );

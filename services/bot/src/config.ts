@@ -15,7 +15,8 @@ const envSchema = z.object({
   // Solana
   SOLANA_RPC_URL: z.string().default('https://api.mainnet-beta.solana.com'),
   SOLANA_PRIVATE_KEY_BASE58: z.string().optional(),
-  JUPITER_API_BASE: z.string().default('https://quote-api.jup.ag/v6'),
+  JUPITER_API_BASE: z.string().default('https://api.jup.ag/swap/v1'),
+  JUPITER_API_KEY: z.string().optional(), // Get free key at https://station.jup.ag/docs/apis/api-keys
   SOLANA_PRIORITY_FEE_MICRO_LAMPORTS: z.string().default('1000'),
 
   // Avalanche
@@ -66,6 +67,7 @@ function loadConfig() {
       rpcUrl: result.data.SOLANA_RPC_URL,
       privateKeyBase58: result.data.SOLANA_PRIVATE_KEY_BASE58,
       jupiterApiBase: result.data.JUPITER_API_BASE,
+      jupiterApiKey: result.data.JUPITER_API_KEY,
       priorityFeeMicroLamports: parseInt(result.data.SOLANA_PRIORITY_FEE_MICRO_LAMPORTS, 10),
     },
     avalanche: {

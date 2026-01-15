@@ -1,5 +1,6 @@
 generator client {
-  provider = "prisma-client-js"
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "linux-musl-arm64-openssl-3.0.x", "linux-musl-openssl-3.0.x"]
 }
 
 datasource db {
@@ -54,6 +55,13 @@ enum TradeSizeMode {
   PERCENT_BALANCE
 }
 
+// Compounding mode for calculated trade sizing
+enum CompoundingMode {
+  FIXED           // Always use fixed tradeSize (original behavior)
+  FULL_BALANCE    // Use full available balance minus reserve
+  CALCULATED      // Calculate based on realized gains with reserve buffer
+}
+
 // Starting mode for new bots
 enum StartingMode {
   START_BY_BUYING
@@ -71,6 +79,12 @@ enum PnLMethod {
 enum ExitMode {
   FULL_EXIT     // Default: sell entire position at target
   SCALE_OUT     // Sell primary portion, hold remainder for extension
+}
+
+// Cycle mode for buy/sell strategy
+enum CycleMode {
+  STANDARD        // Default: simple buy-dip/sell-rise loop
+  ROLLING_REBUY   // Partial sell (primarySellPct) + rebuy on dip
 }
 
 // Extension state for scale-out mode
@@ -209,6 +223,48 @@ model BotConfig {
   // Allow scale-out for WHALE tier (default false, requires explicit enable)
   scaleOutAllowWhale        Boolean   @default(false)
 
+  // === COMPOUNDING MODE CONFIGURATION ===
+  // Compounding mode for calculated trade sizing
+  compoundingMode           CompoundingMode @default(FIXED)
+
+  // Initial trade size (optional - for CALCULATED mode baseline)
+  initialTradeSizeUsdc      Float?
+
+  // Reserve percentage to hold back from compounding (default 5%)
+  compoundingReservePct     Float     @default(5.0)
+
+  // === MULTI-STEP SCALE-OUT CONFIGURATION ===
+  // Number of scale-out exit steps (default 1 = original behavior)
+  scaleOutSteps             Int       @default(1)
+
+  // Total percentage range for scale-out exits (default 2.0% above entry)
+  scaleOutRangePct          Float     @default(2.0)
+
+  // Custom spacing between scale-out levels (optional - auto-calculated if null)
+  scaleOutSpacingPct        Float?
+
+  // === ROLLING REBUY CONFIGURATION ===
+  // Cycle mode: STANDARD (default) or ROLLING_REBUY
+  cycleMode                 CycleMode @default(STANDARD)
+
+  // Primary sell percentage for ROLLING_REBUY mode (default 80%)
+  primarySellPct            Float     @default(80.0)
+
+  // Allow rebuy after partial sell (default false)
+  allowRebuy                Boolean   @default(false)
+
+  // Maximum number of rebuys per cycle (default 1)
+  maxRebuyCount             Int       @default(1)
+
+  // Exposure cap as percentage of portfolio (default 50%)
+  exposureCapPct            Float     @default(50.0)
+
+  // Only rebuy in favorable regimes (CHOP/TREND, not CHAOS)
+  rebuyRegimeGate           Boolean   @default(true)
+
+  // Dip percentage required to trigger rebuy (default same as buyDipPct)
+  rebuyDipPct               Float?
+
   // Alerting
   webhookUrl            String?
   discordWebhookUrl     String?
@@ -267,6 +323,16 @@ model BotInstance {
   // Realized PnL from primary exit (before extension completes)
   extensionPrimaryPnl   Float         @default(0)
 
+  // === ROLLING REBUY STATE ===
+  // Number of rebuys executed in current cycle
+  rebuyCount            Int           @default(0)
+
+  // Price at which last rebuy occurred
+  lastRebuyPrice        Float?
+
+  // Timestamp of last rebuy
+  lastRebuyAt           DateTime?
+
   // Safety state
   consecutiveFailures   Int           @default(0)
   tradesThisHour        Int           @default(0)
@@ -310,6 +376,9 @@ model TradeAttempt {
 
   side                  TradeSide
   status                TradeStatus   @default(PENDING)
+
+  // Dry run flag - synthetic trades for simulation
+  isDryRun              Boolean       @default(false)
 
   // Quote data
   quotePrice            Float         // Expected price from quote

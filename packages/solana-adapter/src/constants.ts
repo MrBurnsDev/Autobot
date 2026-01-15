@@ -11,8 +11,8 @@ export const WSOL_MINT = SOL_MINT;
 export const SOL_DECIMALS = 9;
 export const USDC_DECIMALS = 6;
 
-// Jupiter API endpoints
-export const JUPITER_API_BASE = 'https://quote-api.jup.ag/v6';
+// Jupiter API endpoints - requires API key from https://station.jup.ag/docs/apis/api-keys
+export const JUPITER_API_BASE = 'https://api.jup.ag/swap/v1';
 export const JUPITER_QUOTE_ENDPOINT = `${JUPITER_API_BASE}/quote`;
 export const JUPITER_SWAP_ENDPOINT = `${JUPITER_API_BASE}/swap`;
 

@@ -196,7 +196,12 @@ export class TradingStrategy {
 
     switch (this.config.tradeSizeMode) {
       case 'FIXED_QUOTE':
-        quoteAmount = this.config.tradeSize;
+        if (side === 'BUY') {
+          quoteAmount = this.config.tradeSize;
+        } else {
+          // For SELL with FIXED_QUOTE: sell all available base (quote validation at execution)
+          baseAmount = safeSubtract(balances.base, this.config.minBaseReserve);
+        }
         break;
 
       case 'FIXED_BASE':

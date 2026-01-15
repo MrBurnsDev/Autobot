@@ -35,6 +35,9 @@ RUN pnpm --filter @autobot/bot build
 # Production stage
 FROM node:20-alpine AS runner
 
+# Install OpenSSL for Prisma compatibility
+RUN apk add --no-cache openssl
+
 RUN corepack enable && corepack prepare pnpm@9.15.0 --activate
 
 WORKDIR /app
@@ -62,6 +65,9 @@ COPY --from=builder /app/services/bot/dist ./services/bot/dist
 # Copy node_modules
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/packages/db/node_modules ./packages/db/node_modules
+COPY --from=builder /app/packages/core/node_modules ./packages/core/node_modules
+COPY --from=builder /app/packages/solana-adapter/node_modules ./packages/solana-adapter/node_modules
+COPY --from=builder /app/packages/avalanche-adapter/node_modules ./packages/avalanche-adapter/node_modules
 COPY --from=builder /app/services/bot/node_modules ./services/bot/node_modules
 
 # Run database migrations on startup

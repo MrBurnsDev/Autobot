@@ -29,6 +29,21 @@ export interface ScaleOutConfig {
   minDollarProfit: number;      // e.g., $2
   trailingStopPct: number;      // e.g., 1.0%
   allowWhale: boolean;
+  // Multi-step scale-out configuration
+  scaleOutSteps: number;        // Number of exit steps (default 1 = original behavior)
+  scaleOutRangePct: number;     // Total price range for exits (e.g., 2.0%)
+  scaleOutSpacingPct: number | null;  // Custom spacing (auto-calculated if null)
+}
+
+/**
+ * Multi-step exit level definition
+ */
+export interface ScaleOutLevel {
+  step: number;                 // 0 = primary, 1+ = extension steps
+  qtyPct: number;               // Percentage of total position to sell
+  targetPricePct: number;       // Target price % above entry
+  qty: number;                  // Calculated quantity for this level
+  targetPrice: number;          // Calculated target price
 }
 
 /**
@@ -42,6 +57,10 @@ export interface ExtensionStateData {
   peakPrice: number | null;
   startedAt: Date | null;
   primaryPnl: number;
+  // Multi-step tracking
+  currentStep: number;          // Current step index (0 = primary done, waiting for step 1)
+  completedSteps: number[];     // Array of completed step indices
+  levels: ScaleOutLevel[];      // Calculated exit levels
 }
 
 /**
@@ -81,6 +100,9 @@ export const DEFAULT_SCALE_OUT_CONFIG: ScaleOutConfig = {
   minDollarProfit: 2.0,
   trailingStopPct: 1.0,
   allowWhale: false,
+  scaleOutSteps: 1,
+  scaleOutRangePct: 2.0,
+  scaleOutSpacingPct: null,
 };
 
 /**
@@ -415,6 +437,264 @@ export class ScaleOutManager {
     const totalPnl = safeAdd(primaryPnl, secondaryPnl);
 
     return { primaryPnl, secondaryPnl, totalPnl };
+  }
+
+  /**
+   * Calculate multi-step scale-out exit levels
+   *
+   * For N steps, distributes the secondary (extension) portion across N levels
+   * at progressively higher price targets.
+   *
+   * Example with 3 steps, primaryPct=0.65, secondaryPct=0.35, rangePct=2.0:
+   * - Step 0 (primary): 65% at entry price (sell trigger)
+   * - Step 1: 11.67% at entry + 0.67%
+   * - Step 2: 11.67% at entry + 1.33%
+   * - Step 3: 11.67% at entry + 2.0%
+   */
+  calculateMultiStepLevels(
+    totalBaseQty: number,
+    totalBaseCost: number,
+    entryPrice: number
+  ): ScaleOutLevel[] {
+    const steps = Math.max(1, this.config.scaleOutSteps);
+    const levels: ScaleOutLevel[] = [];
+
+    // Calculate primary exit level (step 0)
+    const primaryQty = safeMultiply(totalBaseQty, this.config.primaryPct);
+    const primaryCost = safeMultiply(totalBaseCost, this.config.primaryPct);
+
+    levels.push({
+      step: 0,
+      qtyPct: this.config.primaryPct,
+      targetPricePct: 0, // Primary exits at sell trigger, not a fixed target
+      qty: primaryQty,
+      targetPrice: entryPrice, // Placeholder - actual trigger determined by sellRisePct
+    });
+
+    // Calculate extension levels (steps 1 to N)
+    const secondaryQty = safeMultiply(totalBaseQty, this.config.secondaryPct);
+    const qtyPerStep = safeDivide(secondaryQty, steps);
+    const qtyPctPerStep = safeDivide(this.config.secondaryPct, steps);
+
+    // Calculate spacing between levels
+    const spacing = this.config.scaleOutSpacingPct !== null
+      ? this.config.scaleOutSpacingPct
+      : safeDivide(this.config.scaleOutRangePct, steps);
+
+    for (let i = 1; i <= steps; i++) {
+      const targetPricePct = safeMultiply(spacing, i);
+      const targetPrice = safeMultiply(entryPrice, 1 + targetPricePct / 100);
+
+      levels.push({
+        step: i,
+        qtyPct: qtyPctPerStep,
+        targetPricePct,
+        qty: qtyPerStep,
+        targetPrice,
+      });
+    }
+
+    logger.info('Multi-step scale-out levels calculated', {
+      steps,
+      levels: levels.map(l => ({
+        step: l.step,
+        qtyPct: `${(l.qtyPct * 100).toFixed(1)}%`,
+        targetPricePct: `${l.targetPricePct.toFixed(2)}%`,
+        targetPrice: l.targetPrice.toFixed(4),
+      })),
+    });
+
+    return levels;
+  }
+
+  /**
+   * Evaluate multi-step extension exit
+   *
+   * Checks if any uncompleted extension level's target has been hit
+   */
+  evaluateMultiStepExit(
+    extensionState: ExtensionStateData,
+    currentPrice: number,
+    quote: QuoteResult,
+    regime: MarketRegime
+  ): ScaleOutDecision {
+    const { baseQty, baseCost, entryPrice, peakPrice, levels, currentStep, completedSteps } = extensionState;
+
+    if (entryPrice === null) {
+      logger.error('Multi-step extension state invalid: no entry price');
+      return this.buildExtensionAbort(baseQty, baseCost, currentPrice, 'Invalid extension state');
+    }
+
+    // CHAOS regime - exit all remaining extension immediately
+    if (regime === 'CHAOS') {
+      logger.warn('CHAOS regime - forcing all extension exit');
+      return this.buildExtensionAbort(baseQty, baseCost, currentPrice, 'CHAOS regime forced exit');
+    }
+
+    // Find the next uncompleted level
+    const pendingLevels = levels.filter(l => l.step > 0 && !completedSteps.includes(l.step));
+
+    if (pendingLevels.length === 0) {
+      // All extension levels completed
+      return {
+        action: 'HOLD_EXTENSION',
+        sellQty: 0,
+        reason: 'All extension levels completed',
+        expectedPnl: 0,
+        isExtensionExit: false,
+        shouldStartExtension: false,
+        extensionQty: 0,
+        extensionCost: 0,
+      };
+    }
+
+    // Check execution cost
+    const costResult = this.costCalculator.calculateExecutionCost(quote);
+
+    // Check each pending level to see if target is hit
+    for (const level of pendingLevels) {
+      if (currentPrice >= level.targetPrice) {
+        // Target hit for this level
+        const levelCostBasisPerUnit = safeDivide(baseCost, baseQty);
+        const levelCost = safeMultiply(level.qty, levelCostBasisPerUnit);
+        const proceeds = safeMultiply(level.qty, currentPrice);
+        const pnl = safeSubtract(proceeds, levelCost);
+        const pnlAfterFees = safeSubtract(pnl, safeMultiply(proceeds, costResult.totalExecutionCostPct / 100));
+
+        logger.info('Multi-step extension level hit', {
+          step: level.step,
+          targetPrice: level.targetPrice,
+          currentPrice,
+          qty: level.qty,
+          pnl: pnlAfterFees,
+        });
+
+        // Calculate remaining extension qty and cost after this exit
+        const remainingQty = safeSubtract(baseQty, level.qty);
+        const remainingCost = safeSubtract(baseCost, levelCost);
+
+        return {
+          action: 'EXTENSION_EXIT',
+          sellQty: level.qty,
+          reason: `Step ${level.step} target hit: ${currentPrice.toFixed(4)} >= ${level.targetPrice.toFixed(4)}`,
+          expectedPnl: pnlAfterFees,
+          isExtensionExit: true,
+          shouldStartExtension: remainingQty > 0, // Continue extension if more levels remain
+          extensionQty: remainingQty,
+          extensionCost: remainingCost,
+        };
+      }
+    }
+
+    // Check trailing stop if enabled
+    if (this.config.trailingEnabled && peakPrice !== null) {
+      const trailingStopPrice = safeMultiply(peakPrice, 1 - this.config.trailingStopPct / 100);
+      const extensionGain = safeDivide(safeSubtract(peakPrice, entryPrice), entryPrice) * 100;
+
+      if (extensionGain >= this.config.minExtensionPct && currentPrice <= trailingStopPrice) {
+        logger.info('Multi-step trailing stop triggered - exiting all remaining', {
+          currentPrice,
+          peakPrice,
+          trailingStop: trailingStopPrice,
+          remainingLevels: pendingLevels.length,
+        });
+
+        const proceeds = safeMultiply(baseQty, currentPrice);
+        const pnl = safeSubtract(proceeds, baseCost);
+        const pnlAfterFees = safeSubtract(pnl, safeMultiply(proceeds, costResult.totalExecutionCostPct / 100));
+
+        return {
+          action: 'EXTENSION_EXIT',
+          sellQty: baseQty, // Exit entire remaining extension
+          reason: `Trailing stop: ${currentPrice.toFixed(4)} <= ${trailingStopPrice.toFixed(4)} (${pendingLevels.length} levels remaining)`,
+          expectedPnl: pnlAfterFees,
+          isExtensionExit: true,
+          shouldStartExtension: false,
+          extensionQty: 0,
+          extensionCost: 0,
+        };
+      }
+    }
+
+    // Check pullback protection
+    const pullbackThreshold = safeMultiply(entryPrice, 1 + this.costConfig.minimumNetEdgePct / 100);
+    const proceeds = safeMultiply(baseQty, currentPrice);
+    const pnl = safeSubtract(proceeds, baseCost);
+    const pnlAfterFees = safeSubtract(pnl, safeMultiply(proceeds, costResult.totalExecutionCostPct / 100));
+
+    if (currentPrice < pullbackThreshold && pnlAfterFees < this.config.minDollarProfit) {
+      logger.warn('Multi-step pullback protection triggered', {
+        currentPrice,
+        pullbackThreshold,
+        pnl: pnlAfterFees,
+        remainingLevels: pendingLevels.length,
+      });
+
+      return {
+        action: 'EXTENSION_EXIT',
+        sellQty: baseQty,
+        reason: `Pullback protection: price near entry with insufficient profit`,
+        expectedPnl: pnlAfterFees,
+        isExtensionExit: true,
+        shouldStartExtension: false,
+        extensionQty: 0,
+        extensionCost: 0,
+      };
+    }
+
+    // Hold - no targets hit yet
+    const nextLevel = pendingLevels[0]!;
+    return {
+      action: 'HOLD_EXTENSION',
+      sellQty: 0,
+      reason: `Holding: price ${currentPrice.toFixed(4)}, next target ${nextLevel.targetPrice.toFixed(4)} (step ${nextLevel.step})`,
+      expectedPnl: pnlAfterFees,
+      isExtensionExit: false,
+      shouldStartExtension: false,
+      extensionQty: baseQty,
+      extensionCost: baseCost,
+    };
+  }
+
+  /**
+   * Check if multi-step mode is enabled
+   */
+  isMultiStepEnabled(): boolean {
+    return this.config.scaleOutSteps > 1;
+  }
+
+  /**
+   * Get number of configured steps
+   */
+  getStepCount(): number {
+    return this.config.scaleOutSteps;
+  }
+
+  /**
+   * Create initial extension state data for multi-step
+   */
+  createMultiStepExtensionState(
+    baseQty: number,
+    baseCost: number,
+    entryPrice: number,
+    primaryPnl: number,
+    totalBaseQty: number,
+    totalBaseCost: number
+  ): ExtensionStateData {
+    const levels = this.calculateMultiStepLevels(totalBaseQty, totalBaseCost, entryPrice);
+
+    return {
+      state: 'ACTIVE',
+      baseQty,
+      baseCost,
+      entryPrice,
+      peakPrice: entryPrice,
+      startedAt: new Date(),
+      primaryPnl,
+      currentStep: 0, // Primary just completed
+      completedSteps: [0], // Mark primary as completed
+      levels,
+    };
   }
 }
 

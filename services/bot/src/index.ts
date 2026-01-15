@@ -8,6 +8,8 @@ import { tradesRoutes } from './routes/trades.js';
 import { pnlRoutes } from './routes/pnl.js';
 import { healthRoutes } from './routes/health.js';
 import { Logger } from '@autobot/core';
+import { prisma } from '@autobot/db';
+import { startWorker } from './workers/trading-worker.js';
 
 const logger = new Logger('Server');
 
@@ -62,6 +64,27 @@ async function main() {
     });
 
     logger.info(`Server started on ${config.server.host}:${config.server.port}`);
+
+    // Auto-restart workers for instances that were RUNNING before server restart
+    const runningInstances = await prisma.botInstance.findMany({
+      where: { status: 'RUNNING' },
+      include: { config: true },
+    });
+
+    for (const instance of runningInstances) {
+      logger.info('Auto-restarting worker for running instance', {
+        instanceId: instance.id,
+        configName: instance.config.name,
+      });
+      try {
+        await startWorker(instance.id);
+      } catch (err) {
+        logger.error('Failed to auto-restart worker', {
+          instanceId: instance.id,
+          error: (err as Error).message,
+        });
+      }
+    }
   } catch (err) {
     logger.error('Failed to start server', { error: (err as Error).message });
     process.exit(1);

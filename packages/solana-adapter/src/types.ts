@@ -92,6 +92,7 @@ export interface SolanaAdapterConfig {
   rpcUrl: string;
   privateKeyBase58: string;
   jupiterApiBase?: string;
+  jupiterApiKey?: string; // API key from https://station.jup.ag/docs/apis/api-keys
   priorityFeeMicroLamports?: number;
   useVersionedTransactions?: boolean;
   confirmationCommitment?: 'processed' | 'confirmed' | 'finalized';

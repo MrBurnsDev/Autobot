@@ -26,6 +26,7 @@ export function getAdapter(chain: Chain, instanceId?: string): ChainAdapter {
         rpcUrl: config.solana.rpcUrl,
         privateKeyBase58: config.solana.privateKeyBase58,
         jupiterApiBase: config.solana.jupiterApiBase,
+        jupiterApiKey: config.solana.jupiterApiKey,
         priorityFeeMicroLamports: config.solana.priorityFeeMicroLamports,
       });
       break;

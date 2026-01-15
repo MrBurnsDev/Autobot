@@ -12,7 +12,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
-      - "5432:5432"
+      - "5433:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U autobot -d autobot"]
       interval: 10s
@@ -39,6 +39,9 @@ services:
       dockerfile: Dockerfile.bot
     container_name: autobot-bot
     restart: unless-stopped
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
     depends_on:
       postgres:
         condition: service_healthy
@@ -53,7 +56,8 @@ services:
       # Solana configuration (set these in .env)
       SOLANA_RPC_URL: ${SOLANA_RPC_URL:-https://api.mainnet-beta.solana.com}
       SOLANA_PRIVATE_KEY_BASE58: ${SOLANA_PRIVATE_KEY_BASE58}
-      JUPITER_API_BASE: ${JUPITER_API_BASE:-https://quote-api.jup.ag/v6}
+      JUPITER_API_BASE: ${JUPITER_API_BASE:-https://api.jup.ag/swap/v1}
+      JUPITER_API_KEY: ${JUPITER_API_KEY}
       SOLANA_PRIORITY_FEE_MICRO_LAMPORTS: ${SOLANA_PRIORITY_FEE_MICRO_LAMPORTS:-1000}
       # Avalanche configuration (set these in .env)
       AVALANCHE_RPC_URL: ${AVALANCHE_RPC_URL:-https://api.avax.network/ext/bc/C/rpc}

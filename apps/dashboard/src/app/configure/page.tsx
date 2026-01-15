@@ -4,8 +4,13 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { configApi, healthApi } from '@/lib/api';
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/card';
 import { Button } from '@/components/button';
-import { Plus, Trash2, Edit, Check, RefreshCw } from 'lucide-react';
+import { Plus, Trash2, Edit, Check, RefreshCw, Zap } from 'lucide-react';
 import { useState } from 'react';
+import {
+  STRATEGY_PRESETS,
+  applyPreset,
+  type PresetId,
+} from '@/lib/presets';
 
 const SOLANA_DEXES = [
   'Orca',
@@ -48,6 +53,26 @@ const defaultConfig = {
   excludedSources: [] as string[],
   maxPriceDeviationBps: 200,
   dryRunMode: false,
+  // Compounding settings
+  compoundingMode: 'FIXED' as 'FIXED' | 'FULL_BALANCE' | 'CALCULATED',
+  initialTradeSizeUsdc: null as number | null,
+  compoundingReservePct: 5,
+  // Multi-step scale-out settings
+  scaleOutSteps: 1,
+  scaleOutRangePct: 2.0,
+  scaleOutSpacingPct: null as number | null,
+  // Exit mode settings
+  exitMode: 'FULL_EXIT' as 'FULL_EXIT' | 'SCALE_OUT',
+  scaleOutPrimaryPct: 0.65,
+  scaleOutSecondaryPct: 0.35,
+  // Rolling rebuy settings
+  cycleMode: 'STANDARD' as 'STANDARD' | 'ROLLING_REBUY',
+  primarySellPct: 80,
+  allowRebuy: false,
+  maxRebuyCount: 1,
+  exposureCapPct: 50,
+  rebuyRegimeGate: true,
+  rebuyDipPct: null as number | null,
 };
 
 export default function ConfigurePage() {
@@ -114,8 +139,46 @@ export default function ConfigurePage() {
 
   const dexOptions = formData.chain === 'SOLANA' ? SOLANA_DEXES : AVALANCHE_DEXES;
 
+  const handleApplyPreset = (presetId: PresetId) => {
+    const preset = STRATEGY_PRESETS.find((p) => p.id === presetId);
+    if (preset) {
+      setFormData(applyPreset(formData, preset));
+    }
+  };
+
+  const renderPresetSelector = () => (
+    <div className="mb-6 p-4 bg-secondary/50 rounded-lg border border-border">
+      <div className="flex items-center gap-2 mb-3">
+        <Zap className="h-4 w-4 text-primary" />
+        <h4 className="font-medium">Quick Start Presets</h4>
+      </div>
+      <p className="text-sm text-muted-foreground mb-3">
+        Apply a preset to quickly configure your strategy. You can customize settings after applying.
+      </p>
+      <div className="grid gap-3 md:grid-cols-3">
+        {STRATEGY_PRESETS.map((preset) => (
+          <button
+            key={preset.id}
+            type="button"
+            onClick={() => handleApplyPreset(preset.id)}
+            className="p-3 text-left rounded-lg border border-border bg-background hover:border-primary/50 hover:bg-primary/5 transition-colors"
+          >
+            <div className="mb-1">
+              <span className="font-medium text-sm">{preset.shortName}</span>
+            </div>
+            <p className="text-xs text-muted-foreground line-clamp-2">
+              {preset.description}
+            </p>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+
   const renderForm = () => (
-    <div className="grid gap-4 md:grid-cols-2">
+    <div className="space-y-6">
+      {renderPresetSelector()}
+      <div className="grid gap-4 md:grid-cols-2">
       {/* Basic Settings */}
       <div className="space-y-4">
         <h4 className="font-medium">Basic Settings</h4>
@@ -331,6 +394,183 @@ export default function ConfigurePage() {
         </div>
       </div>
 
+      {/* Compounding Settings */}
+      <div className="space-y-4">
+        <h4 className="font-medium">Compounding Mode</h4>
+        <p className="text-sm text-muted-foreground">
+          Control how trade size grows with realized gains
+        </p>
+
+        <div>
+          <label className="block text-sm font-medium mb-1">Mode</label>
+          <select
+            value={formData.compoundingMode}
+            onChange={(e) =>
+              setFormData({
+                ...formData,
+                compoundingMode: e.target.value as typeof formData.compoundingMode,
+              })
+            }
+            className="w-full rounded-md border border-border bg-secondary p-2"
+          >
+            <option value="FIXED">Fixed (original behavior)</option>
+            <option value="FULL_BALANCE">Full Balance (use all available)</option>
+            <option value="CALCULATED">Calculated (base + gains)</option>
+          </select>
+        </div>
+
+        {formData.compoundingMode === 'CALCULATED' && (
+          <>
+            <div>
+              <label className="block text-sm font-medium mb-1">Initial Trade Size (USDC)</label>
+              <input
+                type="number"
+                value={formData.initialTradeSizeUsdc ?? ''}
+                onChange={(e) =>
+                  setFormData({
+                    ...formData,
+                    initialTradeSizeUsdc: e.target.value ? parseFloat(e.target.value) : null,
+                  })
+                }
+                className="w-full rounded-md border border-border bg-secondary p-2"
+                placeholder="Uses Trade Size if not set"
+              />
+              <p className="text-xs text-muted-foreground mt-1">
+                Base amount before compounding gains
+              </p>
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium mb-1">
+                Reserve %: {formData.compoundingReservePct}%
+              </label>
+              <input
+                type="range"
+                min="0"
+                max="50"
+                step="1"
+                value={formData.compoundingReservePct}
+                onChange={(e) =>
+                  setFormData({
+                    ...formData,
+                    compoundingReservePct: parseFloat(e.target.value),
+                  })
+                }
+                className="w-full"
+              />
+              <p className="text-xs text-muted-foreground mt-1">
+                Percentage of gains to hold back as buffer
+              </p>
+            </div>
+          </>
+        )}
+
+        {formData.compoundingMode === 'FULL_BALANCE' && (
+          <div>
+            <label className="block text-sm font-medium mb-1">
+              Reserve %: {formData.compoundingReservePct}%
+            </label>
+            <input
+              type="range"
+              min="0"
+              max="50"
+              step="1"
+              value={formData.compoundingReservePct}
+              onChange={(e) =>
+                setFormData({
+                  ...formData,
+                  compoundingReservePct: parseFloat(e.target.value),
+                })
+              }
+              className="w-full"
+            />
+            <p className="text-xs text-muted-foreground mt-1">
+              Percentage of balance to keep as reserve
+            </p>
+          </div>
+        )}
+      </div>
+
+      {/* Multi-Step Scale-Out */}
+      <div className="space-y-4">
+        <h4 className="font-medium">Scale-Out Exits</h4>
+        <p className="text-sm text-muted-foreground">
+          Split exits across multiple price levels
+        </p>
+
+        <div>
+          <label className="block text-sm font-medium mb-1">
+            Exit Steps: {formData.scaleOutSteps}
+          </label>
+          <input
+            type="range"
+            min="1"
+            max="5"
+            step="1"
+            value={formData.scaleOutSteps}
+            onChange={(e) =>
+              setFormData({
+                ...formData,
+                scaleOutSteps: parseInt(e.target.value),
+              })
+            }
+            className="w-full"
+          />
+          <p className="text-xs text-muted-foreground mt-1">
+            {formData.scaleOutSteps === 1
+              ? 'Single exit at target price (default)'
+              : `${formData.scaleOutSteps} exits spread across price range`}
+          </p>
+        </div>
+
+        {formData.scaleOutSteps > 1 && (
+          <>
+            <div>
+              <label className="block text-sm font-medium mb-1">
+                Price Range %: {formData.scaleOutRangePct}%
+              </label>
+              <input
+                type="range"
+                min="0.5"
+                max="5"
+                step="0.1"
+                value={formData.scaleOutRangePct}
+                onChange={(e) =>
+                  setFormData({
+                    ...formData,
+                    scaleOutRangePct: parseFloat(e.target.value),
+                  })
+                }
+                className="w-full"
+              />
+              <p className="text-xs text-muted-foreground mt-1">
+                Total price range for multi-step exits
+              </p>
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium mb-1">Custom Spacing % (optional)</label>
+              <input
+                type="number"
+                value={formData.scaleOutSpacingPct ?? ''}
+                onChange={(e) =>
+                  setFormData({
+                    ...formData,
+                    scaleOutSpacingPct: e.target.value ? parseFloat(e.target.value) : null,
+                  })
+                }
+                className="w-full rounded-md border border-border bg-secondary p-2"
+                placeholder="Auto-calculated from range"
+                step="0.1"
+              />
+              <p className="text-xs text-muted-foreground mt-1">
+                Override automatic spacing between exit levels
+              </p>
+            </div>
+          </>
+        )}
+      </div>
+
       {/* DEX Selection */}
       <div className="space-y-4">
         <h4 className="font-medium">Liquidity Sources</h4>
@@ -370,6 +610,149 @@ export default function ConfigurePage() {
             ))}
           </div>
         </div>
+      </div>
+
+      {/* Rolling Rebuy Settings */}
+      <div className="space-y-4">
+        <h4 className="font-medium">Cycle Mode</h4>
+        <p className="text-sm text-muted-foreground">
+          Control buy/sell cycle behavior
+        </p>
+
+        <div>
+          <label className="block text-sm font-medium mb-1">Mode</label>
+          <select
+            value={formData.cycleMode}
+            onChange={(e) =>
+              setFormData({
+                ...formData,
+                cycleMode: e.target.value as typeof formData.cycleMode,
+              })
+            }
+            className="w-full rounded-md border border-border bg-secondary p-2"
+          >
+            <option value="STANDARD">Standard (full buy/sell cycles)</option>
+            <option value="ROLLING_REBUY">Rolling Rebuy (partial sells + rebuy)</option>
+          </select>
+        </div>
+
+        {formData.cycleMode === 'ROLLING_REBUY' && (
+          <>
+            <div>
+              <label className="block text-sm font-medium mb-1">
+                Primary Sell %: {formData.primarySellPct}%
+              </label>
+              <input
+                type="range"
+                min="50"
+                max="95"
+                step="5"
+                value={formData.primarySellPct}
+                onChange={(e) =>
+                  setFormData({
+                    ...formData,
+                    primarySellPct: parseFloat(e.target.value),
+                  })
+                }
+                className="w-full"
+              />
+              <p className="text-xs text-muted-foreground mt-1">
+                Percentage of position to sell (remainder kept for potential rebuy)
+              </p>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                id="allowRebuy"
+                checked={formData.allowRebuy}
+                onChange={(e) =>
+                  setFormData({ ...formData, allowRebuy: e.target.checked })
+                }
+                className="rounded border-border"
+              />
+              <label htmlFor="allowRebuy" className="text-sm">
+                Allow Rebuy on Dip
+              </label>
+            </div>
+
+            {formData.allowRebuy && (
+              <>
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-sm font-medium mb-1">Max Rebuys</label>
+                    <input
+                      type="number"
+                      value={formData.maxRebuyCount}
+                      onChange={(e) =>
+                        setFormData({
+                          ...formData,
+                          maxRebuyCount: parseInt(e.target.value),
+                        })
+                      }
+                      className="w-full rounded-md border border-border bg-secondary p-2"
+                      min="1"
+                      max="5"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium mb-1">
+                      Exposure Cap %
+                    </label>
+                    <input
+                      type="number"
+                      value={formData.exposureCapPct}
+                      onChange={(e) =>
+                        setFormData({
+                          ...formData,
+                          exposureCapPct: parseFloat(e.target.value),
+                        })
+                      }
+                      className="w-full rounded-md border border-border bg-secondary p-2"
+                      min="20"
+                      max="100"
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-sm font-medium mb-1">
+                    Rebuy Dip % (optional)
+                  </label>
+                  <input
+                    type="number"
+                    value={formData.rebuyDipPct ?? ''}
+                    onChange={(e) =>
+                      setFormData({
+                        ...formData,
+                        rebuyDipPct: e.target.value ? parseFloat(e.target.value) : null,
+                      })
+                    }
+                    className="w-full rounded-md border border-border bg-secondary p-2"
+                    placeholder="Uses Buy Dip % if not set"
+                    step="0.1"
+                  />
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    id="rebuyRegimeGate"
+                    checked={formData.rebuyRegimeGate}
+                    onChange={(e) =>
+                      setFormData({ ...formData, rebuyRegimeGate: e.target.checked })
+                    }
+                    className="rounded border-border"
+                  />
+                  <label htmlFor="rebuyRegimeGate" className="text-sm">
+                    Only rebuy in favorable regimes (not CHAOS)
+                  </label>
+                </div>
+              </>
+            )}
+          </>
+        )}
+      </div>
       </div>
     </div>
   );
@@ -490,6 +873,26 @@ export default function ConfigurePage() {
                           excludedSources: config.excludedSources,
                           maxPriceDeviationBps: config.maxPriceDeviationBps,
                           dryRunMode: config.dryRunMode,
+                          // Compounding settings
+                          compoundingMode: config.compoundingMode ?? 'FIXED',
+                          initialTradeSizeUsdc: config.initialTradeSizeUsdc,
+                          compoundingReservePct: config.compoundingReservePct ?? 5,
+                          // Multi-step scale-out settings
+                          scaleOutSteps: config.scaleOutSteps ?? 1,
+                          scaleOutRangePct: config.scaleOutRangePct ?? 2.0,
+                          scaleOutSpacingPct: config.scaleOutSpacingPct,
+                          // Exit mode settings
+                          exitMode: config.exitMode ?? 'FULL_EXIT',
+                          scaleOutPrimaryPct: config.scaleOutPrimaryPct ?? 0.65,
+                          scaleOutSecondaryPct: config.scaleOutSecondaryPct ?? 0.35,
+                          // Rolling rebuy settings
+                          cycleMode: config.cycleMode ?? 'STANDARD',
+                          primarySellPct: config.primarySellPct ?? 80,
+                          allowRebuy: config.allowRebuy ?? false,
+                          maxRebuyCount: config.maxRebuyCount ?? 1,
+                          exposureCapPct: config.exposureCapPct ?? 50,
+                          rebuyRegimeGate: config.rebuyRegimeGate ?? true,
+                          rebuyDipPct: config.rebuyDipPct,
                         });
                       }}
                     >

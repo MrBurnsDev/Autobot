@@ -43,12 +43,46 @@ import {
   type ScaleOutConfig,
   type ExtensionStateData,
   type ScaleOutDecision,
+  // Compounding modules
+  CompoundingCalculator,
+  formatCompoundingLog,
+  type CompoundingConfig,
+  type CompoundingMode,
+  type TradeSizeResult,
 } from '@autobot/core';
 import { getAdapter } from '../services/adapter-factory.js';
 import { AlertService } from '../services/alert-service.js';
 import { config } from '../config.js';
 
 const logger = new Logger('TradingWorker');
+
+// Price history storage - keeps last hour of ticks per instance
+interface PriceTick {
+  timestamp: number;
+  price: number;
+}
+
+const priceHistory = new Map<string, PriceTick[]>();
+const MAX_PRICE_HISTORY = 360; // ~1 hour at 10s intervals
+
+export function getPriceHistory(instanceId: string): PriceTick[] {
+  return priceHistory.get(instanceId) ?? [];
+}
+
+function recordPriceTick(instanceId: string, price: number): void {
+  let history = priceHistory.get(instanceId);
+  if (!history) {
+    history = [];
+    priceHistory.set(instanceId, history);
+  }
+
+  history.push({ timestamp: Date.now(), price });
+
+  // Trim to max size
+  if (history.length > MAX_PRICE_HISTORY) {
+    history.shift();
+  }
+}
 
 interface WorkerState {
   isRunning: boolean;
@@ -151,6 +185,168 @@ export async function stopWorker(instanceId: string, reason?: string): Promise<v
   logger.info('Worker stopped', { instanceId, reason });
 }
 
+// Manual trade execution (bypasses strategy checks, for testing)
+export async function executeManualTrade(
+  instanceId: string,
+  side: 'BUY' | 'SELL'
+): Promise<{ success: boolean; message: string; tradeId?: string }> {
+  const instance = await prisma.botInstance.findUnique({
+    where: { id: instanceId },
+    include: { config: true },
+  });
+
+  if (!instance) {
+    return { success: false, message: 'Bot instance not found' };
+  }
+
+  const botConfig = instance.config;
+  const adapter = getAdapter(botConfig.chain, instanceId);
+  const pnlCalculator = new PnLCalculator(botConfig.pnlMethod);
+
+  // Get quote for trade size
+  const tradeAmount = botConfig.tradeSize;
+  const quote = await adapter.getQuote({
+    side,
+    amount: tradeAmount,
+    amountIsBase: botConfig.tradeSizeMode === 'FIXED_BASE',
+    slippageBps: botConfig.maxSlippageBps,
+    allowedSources: botConfig.allowedSources,
+    excludedSources: botConfig.excludedSources,
+  });
+
+  const clientOrderId = generateClientOrderId(instanceId, side, Date.now());
+
+  // Create trade attempt
+  const tradeAttempt = await prisma.tradeAttempt.create({
+    data: {
+      instanceId,
+      clientOrderId,
+      side,
+      status: 'PENDING',
+      isDryRun: botConfig.dryRunMode,
+      quotePrice: quote.price,
+      quotedBaseQty: side === 'BUY' ? quote.outputAmount : quote.inputAmount,
+      quotedQuoteQty: side === 'BUY' ? quote.inputAmount : quote.outputAmount,
+      quotedPriceImpactBps: quote.priceImpactBps,
+      quotedSlippageBps: botConfig.maxSlippageBps,
+    },
+  });
+
+  logger.info('Manual trade initiated', {
+    instanceId,
+    clientOrderId,
+    side,
+    isDryRun: botConfig.dryRunMode,
+  });
+
+  if (botConfig.dryRunMode) {
+    // Synthetic trade for dry run
+    await processSyntheticFill(instanceId, tradeAttempt.id, side, quote, botConfig, pnlCalculator);
+    return { success: true, message: `Dry run ${side} executed at $${quote.price.toFixed(4)}`, tradeId: tradeAttempt.id };
+  }
+
+  // Real trade execution
+  try {
+    const result = await adapter.executeSwap({ quote, clientOrderId });
+
+    if (result.success) {
+      // Calculate base/quote amounts based on side
+      const baseQty = side === 'BUY' ? result.outputAmount : result.inputAmount;
+      const quoteQty = side === 'BUY' ? result.inputAmount : result.outputAmount;
+
+      // Record fill
+      const fill: FillForPnL = {
+        side,
+        baseQty,
+        quoteQty,
+        executedPrice: result.executedPrice,
+        feeQuote: 0,
+        feeNativeUsdc: result.feeNativeUsdc,
+      };
+
+      const costBasisPerUnit = instance.totalBaseQty > 0 ? instance.totalBaseCost / instance.totalBaseQty : 0;
+      const pnlResult = side === 'SELL' && costBasisPerUnit > 0
+        ? pnlCalculator.calculateRealizedPnL(fill, costBasisPerUnit)
+        : null;
+      const realizedPnl = pnlResult?.realizedPnl ?? null;
+
+      await prisma.tradeAttempt.update({
+        where: { id: tradeAttempt.id },
+        data: {
+          status: 'CONFIRMED',
+          txSignature: result.txSignature,
+        },
+      });
+
+      await prisma.tradeFill.create({
+        data: {
+          attemptId: tradeAttempt.id,
+          side,
+          baseQty,
+          quoteQty,
+          executedPrice: result.executedPrice,
+          feeNativeUsdc: result.feeNativeUsdc,
+          realizedPnl,
+          txSignature: result.txSignature,
+          executedAt: new Date(),
+        },
+      });
+
+      // Update instance state
+      const updates: Record<string, unknown> = {
+        lastTradeAt: new Date(),
+        consecutiveFailures: 0,
+      };
+
+      if (side === 'BUY') {
+        updates.lastBuyPrice = result.executedPrice;
+        updates.totalBuys = { increment: 1 };
+        updates.totalBuyVolume = { increment: quoteQty };
+        updates.totalBaseCost = { increment: quoteQty };
+        updates.totalBaseQty = { increment: baseQty };
+      } else {
+        updates.lastSellPrice = result.executedPrice;
+        updates.totalSells = { increment: 1 };
+        updates.totalSellVolume = { increment: quoteQty };
+        updates.totalBaseCost = { decrement: costBasisPerUnit * baseQty };
+        updates.totalBaseQty = { decrement: baseQty };
+        if (realizedPnl) {
+          updates.dailyRealizedPnl = { increment: realizedPnl };
+        }
+      }
+
+      await prisma.botInstance.update({
+        where: { id: instanceId },
+        data: updates,
+      });
+
+      return {
+        success: true,
+        message: `${side} executed: ${baseQty.toFixed(4)} @ $${result.executedPrice.toFixed(4)}`,
+        tradeId: tradeAttempt.id,
+      };
+    } else {
+      await prisma.tradeAttempt.update({
+        where: { id: tradeAttempt.id },
+        data: {
+          status: 'FAILED',
+          errorMessage: result.error?.message || 'Unknown error',
+        },
+      });
+      return { success: false, message: result.error?.message || 'Trade failed', tradeId: tradeAttempt.id };
+    }
+  } catch (err) {
+    await prisma.tradeAttempt.update({
+      where: { id: tradeAttempt.id },
+      data: {
+        status: 'FAILED',
+        errorMessage: (err as Error).message,
+      },
+    });
+    return { success: false, message: (err as Error).message, tradeId: tradeAttempt.id };
+  }
+}
+
 export function isWorkerRunning(instanceId: string): boolean {
   return workers.has(instanceId);
 }
@@ -193,11 +389,11 @@ async function executeTradingCycle(instanceId: string, workerState: WorkerState)
 
   const botConfig = instance.config;
   const adapter = getAdapter(botConfig.chain, instanceId);
-  const strategy = new TradingStrategy(buildStrategyConfig(botConfig));
   const pnlCalculator = new PnLCalculator(botConfig.pnlMethod);
 
   // Build execution modules
   const costCalculator = buildCostCalculator(botConfig);
+  const compoundingCalculator = buildCompoundingCalculator(botConfig);
   const regimeClassifier = buildRegimeClassifier(botConfig);
 
   // Get current balances
@@ -274,22 +470,48 @@ async function executeTradingCycle(instanceId: string, workerState: WorkerState)
   // Build strategy state
   const state = await buildStrategyState(instance);
 
+  // === COMPOUNDING: Calculate dynamic trade size for BUY actions ===
+  // Query total realized PnL for compounding calculation
+  const totalRealizedPnl = await getTotalRealizedPnl(instanceId);
+  const compoundingResult = compoundingCalculator.calculateBuySize(
+    balances.quote,
+    instance.dailyRealizedPnl,
+    totalRealizedPnl
+  );
+
+  // Log compounding calculation if not using FIXED mode
+  if (botConfig.compoundingMode !== 'FIXED') {
+    logger.info('Compounding calculated', {
+      instanceId,
+      log: formatCompoundingLog(compoundingResult),
+    });
+  }
+
+  // Build strategy config with potentially compounded trade size
+  const effectiveTradeSize = compoundingResult.tradeSizeUsdc > 0
+    ? compoundingResult.tradeSizeUsdc
+    : botConfig.tradeSize;
+
+  const strategyConfig = buildStrategyConfig(botConfig, effectiveTradeSize);
+  const strategy = new TradingStrategy(strategyConfig);
+
   // Evaluate strategy
   const action = strategy.evaluate({
-    config: buildStrategyConfig(botConfig),
+    config: strategyConfig,
     state,
     balances,
     currentPrice,
     quote: discoveryQuote,
   });
 
-  logger.debug('Strategy evaluation', {
+  // Record price for chart
+  recordPriceTick(instanceId, currentPrice);
+
+  logger.info('Tick', {
     instanceId,
+    price: currentPrice.toFixed(4),
     action: action.type,
     reason: action.reason,
-    currentPrice,
-    regime: workerState.currentRegime,
-    extensionState: instance.extensionState,
   });
 
   // Handle action
@@ -440,9 +662,9 @@ async function executeTradeWithCostGating(
     },
   });
 
-  // Check dry-run mode
+  // Check dry-run mode - create synthetic trade
   if (botConfig.dryRunMode) {
-    logger.info('DRY RUN: Would execute trade', {
+    logger.info('DRY RUN: Synthetic trade executed', {
       clientOrderId,
       side,
       quote: {
@@ -456,13 +678,15 @@ async function executeTradeWithCostGating(
       },
     });
 
-    await prisma.tradeAttempt.update({
-      where: { id: tradeAttempt.id },
-      data: {
-        status: 'CONFIRMED',
-        errorMessage: 'DRY_RUN_MODE',
-      },
-    });
+    // Create synthetic fill record for tracking
+    await processSyntheticFill(
+      instanceId,
+      tradeAttempt.id,
+      side,
+      quote,
+      botConfig,
+      pnlCalculator
+    );
     return;
   }
 
@@ -828,6 +1052,102 @@ async function processSuccessfulFill(
     quoteQty: fill.quoteQty,
     price: result.executedPrice,
     txSignature: result.txSignature,
+  });
+}
+
+/**
+ * Process a synthetic (dry run) fill - creates records for tracking without executing on-chain
+ */
+async function processSyntheticFill(
+  instanceId: string,
+  tradeAttemptId: string,
+  side: TradeSide,
+  quote: QuoteResult,
+  botConfig: BotConfig,
+  pnlCalculator: PnLCalculator
+): Promise<void> {
+  // Use quote data as synthetic execution data
+  const syntheticFill: FillForPnL = {
+    side,
+    baseQty: side === 'BUY' ? quote.outputAmount : quote.inputAmount,
+    quoteQty: side === 'BUY' ? quote.inputAmount : quote.outputAmount,
+    executedPrice: quote.price,
+    feeQuote: 0,
+    feeNativeUsdc: 0.001, // Simulate small gas fee
+  };
+
+  const instance = await prisma.botInstance.findUnique({
+    where: { id: instanceId },
+  });
+
+  let realizedPnl = 0;
+  let costBasisPerUnit = 0;
+
+  if (side === 'SELL' && instance && instance.totalBaseQty > 0) {
+    costBasisPerUnit = instance.totalBaseCost / instance.totalBaseQty;
+    const pnlResult = pnlCalculator.calculateRealizedPnL(syntheticFill, costBasisPerUnit);
+    realizedPnl = pnlResult.realizedPnl;
+  }
+
+  // Mark trade attempt as dry run and confirmed
+  await prisma.tradeAttempt.update({
+    where: { id: tradeAttemptId },
+    data: {
+      status: 'CONFIRMED',
+      isDryRun: true,
+      confirmedAt: new Date(),
+    },
+  });
+
+  // Create synthetic fill record
+  await prisma.tradeFill.create({
+    data: {
+      attemptId: tradeAttemptId,
+      side,
+      baseQty: syntheticFill.baseQty,
+      quoteQty: syntheticFill.quoteQty,
+      executedPrice: quote.price,
+      feeQuote: 0,
+      feeNative: 0,
+      feeNativeUsdc: 0.001,
+      actualSlippageBps: quote.priceImpactBps,
+      costBasisPerUnit: side === 'SELL' ? costBasisPerUnit : null,
+      realizedPnl: side === 'SELL' ? realizedPnl : null,
+      txSignature: `DRY_RUN_${Date.now()}`,
+      executedAt: new Date(),
+    },
+  });
+
+  // Update instance state (simulated position changes)
+  await updateInstanceAfterFill(instanceId, side, syntheticFill, realizedPnl, pnlCalculator, instance);
+
+  // Send alert
+  const alertService = new AlertService(
+    botConfig.webhookUrl ?? config.alerts.webhookUrl,
+    botConfig.discordWebhookUrl ?? config.alerts.discordWebhookUrl
+  );
+  await alertService.sendAlert({
+    instanceId,
+    type: 'TRADE_EXECUTED',
+    title: `[DRY RUN] ${side} Executed`,
+    message: `[SIMULATED] ${side} ${syntheticFill.baseQty.toFixed(4)} ${botConfig.chain === 'SOLANA' ? 'SOL' : 'AVAX'} @ ${quote.price.toFixed(4)} USDC`,
+    metadata: {
+      side,
+      baseQty: syntheticFill.baseQty,
+      quoteQty: syntheticFill.quoteQty,
+      price: quote.price,
+      isDryRun: true,
+      realizedPnl: side === 'SELL' ? realizedPnl : undefined,
+    },
+  });
+
+  logger.info('Synthetic trade recorded', {
+    instanceId,
+    side,
+    baseQty: syntheticFill.baseQty,
+    quoteQty: syntheticFill.quoteQty,
+    price: quote.price,
+    isDryRun: true,
   });
 }
 
@@ -1245,12 +1565,12 @@ function buildSplitExecutor(botConfig: BotConfig): SplitExecutor {
   });
 }
 
-function buildStrategyConfig(botConfig: BotConfig): StrategyConfig {
+function buildStrategyConfig(botConfig: BotConfig, tradeSizeOverride?: number): StrategyConfig {
   return {
     buyDipPct: botConfig.buyDipPct,
     sellRisePct: botConfig.sellRisePct,
     tradeSizeMode: botConfig.tradeSizeMode,
-    tradeSize: botConfig.tradeSize,
+    tradeSize: tradeSizeOverride ?? botConfig.tradeSize,
     minTradeNotional: botConfig.minTradeNotional,
     maxSlippageBps: botConfig.maxSlippageBps,
     maxPriceImpactBps: botConfig.maxPriceImpactBps,
@@ -1270,6 +1590,26 @@ function buildStrategyConfig(botConfig: BotConfig): StrategyConfig {
     maxPriceDeviationBps: botConfig.maxPriceDeviationBps,
     dryRunMode: botConfig.dryRunMode,
   };
+}
+
+/**
+ * Get total realized PnL from all confirmed trade fills
+ */
+async function getTotalRealizedPnl(instanceId: string): Promise<number> {
+  const result = await prisma.tradeFill.aggregate({
+    where: {
+      attempt: {
+        instanceId,
+        status: 'CONFIRMED',
+      },
+      realizedPnl: { not: null },
+    },
+    _sum: {
+      realizedPnl: true,
+    },
+  });
+
+  return result._sum.realizedPnl ?? 0;
 }
 
 async function buildStrategyState(instance: BotInstance): Promise<StrategyState> {
@@ -1302,6 +1642,25 @@ function applyRegimeAdjustments(
 // === SCALE-OUT EXIT FUNCTIONS ===
 
 /**
+ * Build CompoundingCalculator from bot config
+ */
+function buildCompoundingCalculator(botConfig: BotConfig): CompoundingCalculator {
+  // Map DB CompoundingMode to core CompoundingMode type
+  const mode: CompoundingMode = (botConfig.compoundingMode as CompoundingMode) || 'FIXED';
+
+  const compoundingConfig: CompoundingConfig = {
+    mode,
+    fixedTradeSize: botConfig.tradeSize,
+    initialTradeSizeUsdc: botConfig.initialTradeSizeUsdc,
+    reservePct: botConfig.compoundingReservePct,
+    minTradeNotional: botConfig.minTradeNotional,
+    minQuoteReserve: botConfig.minQuoteReserve,
+  };
+
+  return new CompoundingCalculator(compoundingConfig);
+}
+
+/**
  * Build ScaleOutManager from bot config
  */
 function buildScaleOutManager(
@@ -1318,6 +1677,10 @@ function buildScaleOutManager(
     minDollarProfit: botConfig.scaleOutMinDollarProfit,
     trailingStopPct: botConfig.scaleOutTrailingStopPct,
     allowWhale: botConfig.scaleOutAllowWhale,
+    // Multi-step scale-out fields
+    scaleOutSteps: botConfig.scaleOutSteps,
+    scaleOutRangePct: botConfig.scaleOutRangePct,
+    scaleOutSpacingPct: botConfig.scaleOutSpacingPct,
   };
 
   return new ScaleOutManager(scaleOutConfig, {
@@ -1343,6 +1706,10 @@ function buildExtensionStateData(instance: BotInstance): ExtensionStateData {
     peakPrice: instance.extensionPeakPrice,
     startedAt: instance.extensionStartedAt,
     primaryPnl: instance.extensionPrimaryPnl,
+    // Multi-step fields (initialized empty for backward compatibility)
+    currentStep: 0,
+    completedSteps: [],
+    levels: [],
   };
 }
 
@@ -1529,24 +1896,67 @@ async function executePrimaryExit(
     },
   });
 
-  // Check dry-run mode
+  // Check dry-run mode - create synthetic primary exit
   if (botConfig.dryRunMode) {
-    logger.info('DRY RUN: Would execute primary exit', {
+    logger.info('DRY RUN: Synthetic primary exit executed', {
       clientOrderId,
       sellQty: decision.sellQty,
       extensionQty: decision.extensionQty,
     });
 
+    // Create synthetic fill for primary exit
+    const syntheticFill: FillForPnL = {
+      side,
+      baseQty: decision.sellQty,
+      quoteQty: decision.sellQty * currentPrice,
+      executedPrice: currentPrice,
+      feeQuote: 0,
+      feeNativeUsdc: 0.001,
+    };
+
+    const costBasisPerUnit = instance.totalBaseCost / instance.totalBaseQty;
+    const primaryPnlResult = pnlCalculator.calculateRealizedPnL(syntheticFill, costBasisPerUnit);
+
     await prisma.tradeAttempt.update({
       where: { id: tradeAttempt.id },
       data: {
         status: 'CONFIRMED',
-        errorMessage: 'DRY_RUN_MODE',
+        isDryRun: true,
+        confirmedAt: new Date(),
       },
     });
 
-    // Simulate extension start in dry-run
-    await startExtension(instanceId, decision, currentPrice, 0);
+    await prisma.tradeFill.create({
+      data: {
+        attemptId: tradeAttempt.id,
+        side,
+        baseQty: syntheticFill.baseQty,
+        quoteQty: syntheticFill.quoteQty,
+        executedPrice: currentPrice,
+        feeQuote: 0,
+        feeNative: 0,
+        feeNativeUsdc: 0.001,
+        actualSlippageBps: null,
+        costBasisPerUnit,
+        realizedPnl: primaryPnlResult.realizedPnl,
+        txSignature: `DRY_RUN_PRIMARY_${Date.now()}`,
+        executedAt: new Date(),
+      },
+    });
+
+    // Update instance after primary exit
+    await updateInstanceAfterPrimaryExit(instanceId, syntheticFill, primaryPnlResult.realizedPnl, instance);
+
+    // Start extension with remaining portion
+    await startExtension(instanceId, decision, currentPrice, primaryPnlResult.realizedPnl);
+
+    logger.info('Synthetic primary exit recorded, extension started', {
+      instanceId,
+      primaryQty: decision.sellQty,
+      primaryPnl: primaryPnlResult.realizedPnl,
+      extensionQty: decision.extensionQty,
+      isDryRun: true,
+    });
     return;
   }
 
@@ -1757,24 +2167,67 @@ async function executeExtensionExit(
     },
   });
 
-  // Check dry-run mode
+  // Check dry-run mode - create synthetic extension exit
   if (botConfig.dryRunMode) {
-    logger.info('DRY RUN: Would execute extension exit', {
+    logger.info('DRY RUN: Synthetic extension exit executed', {
       clientOrderId,
       extensionQty: instance.extensionBaseQty,
       reason: decision.reason,
     });
 
+    // Create synthetic fill for extension exit
+    const syntheticFill: FillForPnL = {
+      side,
+      baseQty: instance.extensionBaseQty,
+      quoteQty: instance.extensionBaseQty * currentPrice,
+      executedPrice: currentPrice,
+      feeQuote: 0,
+      feeNativeUsdc: 0.001,
+    };
+
+    const costBasisPerUnit = instance.extensionBaseCost / instance.extensionBaseQty;
+    const extensionPnlResult = pnlCalculator.calculateRealizedPnL(syntheticFill, costBasisPerUnit);
+
     await prisma.tradeAttempt.update({
       where: { id: tradeAttempt.id },
       data: {
         status: 'CONFIRMED',
-        errorMessage: 'DRY_RUN_MODE',
+        isDryRun: true,
+        confirmedAt: new Date(),
       },
     });
 
-    // Clear extension state in dry-run
-    await clearExtension(instanceId, 0);
+    await prisma.tradeFill.create({
+      data: {
+        attemptId: tradeAttempt.id,
+        side,
+        baseQty: syntheticFill.baseQty,
+        quoteQty: syntheticFill.quoteQty,
+        executedPrice: currentPrice,
+        feeQuote: 0,
+        feeNative: 0,
+        feeNativeUsdc: 0.001,
+        actualSlippageBps: null,
+        costBasisPerUnit,
+        realizedPnl: extensionPnlResult.realizedPnl,
+        txSignature: `DRY_RUN_EXTENSION_${Date.now()}`,
+        executedAt: new Date(),
+      },
+    });
+
+    const totalCyclePnl = instance.extensionPrimaryPnl + extensionPnlResult.realizedPnl;
+
+    // Clear extension state
+    await clearExtension(instanceId, extensionPnlResult.realizedPnl);
+
+    logger.info('Synthetic extension exit recorded, scale-out complete', {
+      instanceId,
+      extensionQty: syntheticFill.baseQty,
+      extensionPnl: extensionPnlResult.realizedPnl,
+      primaryPnl: instance.extensionPrimaryPnl,
+      totalCyclePnl,
+      isDryRun: true,
+    });
     return;
   }
 

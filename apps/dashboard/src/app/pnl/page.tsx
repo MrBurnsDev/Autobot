@@ -113,6 +113,22 @@ export default function PnLPage() {
         </div>
       ) : (
         <>
+          {/* Dry Run Notice */}
+          {selectedBot?.config?.dryRunMode && (
+            <Card className="border-yellow-500/30 bg-yellow-500/10">
+              <CardContent className="py-3">
+                <div className="flex items-center gap-2">
+                  <span className="px-2 py-0.5 rounded text-xs font-medium bg-yellow-500/20 text-yellow-400">
+                    SIMULATED
+                  </span>
+                  <span className="text-sm text-yellow-300">
+                    This bot is in dry run mode. All trades shown are synthetic simulations - no real transactions are executed.
+                  </span>
+                </div>
+              </CardContent>
+            </Card>
+          )}
+
           {/* PnL Summary Cards */}
           <div className="grid gap-4 md:grid-cols-3">
             <Card>

@@ -15,9 +15,19 @@ const logger = new Logger('JupiterClient');
 
 export class JupiterClient {
   private apiBase: string;
+  private apiKey?: string;
 
-  constructor(apiBase?: string) {
+  constructor(apiBase?: string, apiKey?: string) {
     this.apiBase = apiBase ?? JUPITER_API_BASE;
+    this.apiKey = apiKey;
+  }
+
+  private getHeaders(): Record<string, string> {
+    const headers: Record<string, string> = { Accept: 'application/json' };
+    if (this.apiKey) {
+      headers['x-api-key'] = this.apiKey;
+    }
+    return headers;
   }
 
   /**
@@ -63,7 +73,7 @@ export class JupiterClient {
       async () => {
         const res = await fetch(url.toString(), {
           method: 'GET',
-          headers: { Accept: 'application/json' },
+          headers: this.getHeaders(),
         });
 
         if (!res.ok) {
@@ -117,8 +127,8 @@ export class JupiterClient {
         const res = await fetch(url, {
           method: 'POST',
           headers: {
+            ...this.getHeaders(),
             'Content-Type': 'application/json',
-            Accept: 'application/json',
           },
           body: JSON.stringify({
             userPublicKey: params.userPublicKey,
@@ -179,7 +189,7 @@ export class JupiterClient {
 
       const res = await fetch(testUrl.toString(), {
         method: 'GET',
-        headers: { Accept: 'application/json' },
+        headers: this.getHeaders(),
       });
 
       const latencyMs = Date.now() - start;
