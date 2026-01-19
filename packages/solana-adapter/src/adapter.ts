@@ -308,8 +308,11 @@ export class SolanaAdapter implements ChainAdapter {
         Math.abs((executedPrice - expectedPrice) / expectedPrice) * 10000
       );
 
-      // Estimate fee (from transaction meta)
-      const feeNative = parseTokenAmount(swapResponse.prioritizationFeeLamports + 5000, SOL_DECIMALS);
+      // Estimate fee (from transaction meta or default)
+      const priorityFee = typeof swapResponse.prioritizationFeeLamports === 'number'
+        ? swapResponse.prioritizationFeeLamports
+        : 0;
+      const feeNative = parseTokenAmount(priorityFee + 5000, SOL_DECIMALS);
       const feeNativeUsdc = feeNative * executedPrice;
 
       logger.info('Swap executed successfully', {

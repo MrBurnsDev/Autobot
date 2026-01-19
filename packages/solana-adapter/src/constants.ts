@@ -11,10 +11,15 @@ export const WSOL_MINT = SOL_MINT;
 export const SOL_DECIMALS = 9;
 export const USDC_DECIMALS = 6;
 
-// Jupiter API endpoints - requires API key from https://station.jup.ag/docs/apis/api-keys
-export const JUPITER_API_BASE = 'https://api.jup.ag/swap/v1';
-export const JUPITER_QUOTE_ENDPOINT = `${JUPITER_API_BASE}/quote`;
-export const JUPITER_SWAP_ENDPOINT = `${JUPITER_API_BASE}/swap`;
+// D3fenders Swap API (proxies Jupiter with fee handling)
+export const D3FENDERS_SWAP_API_BASE = 'https://d3fenders-swap-service.vercel.app';
+export const D3FENDERS_SOLANA_QUOTE_ENDPOINT = `${D3FENDERS_SWAP_API_BASE}/solana/quote`;
+export const D3FENDERS_SOLANA_BUILD_ENDPOINT = `${D3FENDERS_SWAP_API_BASE}/solana/build`;
+
+// Legacy Jupiter API endpoints (deprecated - now requires paid API key)
+export const JUPITER_API_BASE = D3FENDERS_SWAP_API_BASE;
+export const JUPITER_QUOTE_ENDPOINT = D3FENDERS_SOLANA_QUOTE_ENDPOINT;
+export const JUPITER_SWAP_ENDPOINT = D3FENDERS_SOLANA_BUILD_ENDPOINT;
 
 // Transaction settings
 export const DEFAULT_COMPUTE_UNIT_LIMIT = 400_000;

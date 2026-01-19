@@ -4,6 +4,7 @@ import { prisma } from '@autobot/db';
 import { PnLCalculator, Logger } from '@autobot/core';
 import { startWorker, stopWorker, isWorkerRunning, getPriceHistory, executeManualTrade } from '../workers/trading-worker.js';
 import { getAdapter } from '../services/adapter-factory.js';
+import { getAllocation, getAllocationSummary, isCapitalIsolationEnabled } from '../services/capital-service.js';
 
 const logger = new Logger('BotRoutes');
 
@@ -102,8 +103,9 @@ export const botRoutes: FastifyPluginAsync = async (fastify) => {
     }
 
     // Check connectivity before starting
+    let adapter;
     try {
-      const adapter = getAdapter(instance.config.chain, instance.id);
+      adapter = getAdapter(instance.config.chain, instance.id);
       const connectivity = await adapter.checkConnectivity();
 
       if (!connectivity.rpcConnected || !connectivity.apiConnected) {
@@ -111,6 +113,58 @@ export const botRoutes: FastifyPluginAsync = async (fastify) => {
       }
     } catch (err) {
       return reply.badRequest(`Failed to initialize adapter: ${(err as Error).message}`);
+    }
+
+    // Preflight capital check if capital isolation is enabled
+    if (instance.config.initialCapitalUSDC !== null) {
+      try {
+        // Get actual wallet balance
+        const balances = await adapter.getBalances();
+        const walletUSDC = balances.quote;
+
+        // Get sum of all active bot allocations (excluding this bot if already allocated)
+        const activeBots = await prisma.botInstance.findMany({
+          where: {
+            status: { in: ['RUNNING', 'PAUSED'] },
+            id: { not: instance.id },
+            config: {
+              initialCapitalUSDC: { not: null },
+            },
+          },
+          include: { config: true },
+        });
+
+        const otherAllocations = activeBots.reduce((sum, bot) => {
+          return sum + (bot.config.initialCapitalUSDC ?? 0);
+        }, 0);
+
+        const thisAllocation = instance.config.initialCapitalUSDC;
+        const totalRequired = otherAllocations + thisAllocation;
+        const feeBuffer = 5; // $5 buffer for fees
+
+        if (walletUSDC < totalRequired + feeBuffer) {
+          return reply.badRequest(
+            `Insufficient wallet balance for allocated capital. ` +
+            `Wallet: $${walletUSDC.toFixed(2)} USDC, ` +
+            `Required: $${totalRequired.toFixed(2)} + $${feeBuffer} buffer = $${(totalRequired + feeBuffer).toFixed(2)}. ` +
+            `Other active bots: $${otherAllocations.toFixed(2)}, This bot: $${thisAllocation.toFixed(2)}`
+          );
+        }
+
+        logger.info('Capital preflight check passed', {
+          instanceId: instance.id,
+          walletUSDC,
+          totalRequired,
+          thisAllocation,
+          otherAllocations,
+        });
+      } catch (err) {
+        logger.warn('Capital preflight check failed, continuing anyway', {
+          instanceId: instance.id,
+          error: (err as Error).message,
+        });
+        // Don't block start if we can't check - the wallet guardrail will catch it
+      }
     }
 
     // Start the worker
@@ -305,5 +359,49 @@ export const botRoutes: FastifyPluginAsync = async (fastify) => {
     });
 
     return reply.code(204).send();
+  });
+
+  // Get capital allocation for a bot
+  fastify.get<{ Params: { id: string } }>('/bots/:id/capital', async (request, reply) => {
+    const instance = await prisma.botInstance.findUnique({
+      where: { id: request.params.id },
+      include: { config: true },
+    });
+
+    if (!instance) {
+      return reply.notFound('Bot instance not found');
+    }
+
+    const capitalEnabled = await isCapitalIsolationEnabled(request.params.id);
+
+    if (!capitalEnabled) {
+      return {
+        enabled: false,
+        message: 'Capital isolation not enabled for this bot (using full wallet balance)',
+        initialCapitalUSDC: null,
+      };
+    }
+
+    const allocation = getAllocation(request.params.id);
+
+    return {
+      enabled: true,
+      initialCapitalUSDC: instance.config.initialCapitalUSDC,
+      allocation: allocation ?? {
+        allocatedUSDC: instance.allocatedUSDC,
+        allocatedSOL: instance.allocatedSOL,
+        reservedUSDCForFees: instance.reservedUSDCForFees,
+        pendingBuyUSDC: instance.pendingBuyUSDC,
+        pendingSellSOL: instance.pendingSellSOL,
+        cumulativeRealizedPnL: instance.cumulativeRealizedPnL,
+        totalBaseCost: instance.totalBaseCost,
+        totalBaseQty: instance.totalBaseQty,
+      },
+    };
+  });
+
+  // Get capital allocation summary across all bots
+  fastify.get('/capital/summary', async () => {
+    return getAllocationSummary();
   });
 };

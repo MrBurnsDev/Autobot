@@ -10,6 +10,7 @@ import { healthRoutes } from './routes/health.js';
 import { Logger } from '@autobot/core';
 import { prisma } from '@autobot/db';
 import { startWorker } from './workers/trading-worker.js';
+import { syncAllAllocations } from './services/capital-service.js';
 
 const logger = new Logger('Server');
 
@@ -64,6 +65,10 @@ async function main() {
     });
 
     logger.info(`Server started on ${config.server.host}:${config.server.port}`);
+
+    // Sync capital allocations from database
+    await syncAllAllocations();
+    logger.info('Capital allocations synced from database');
 
     // Auto-restart workers for instances that were RUNNING before server restart
     const runningInstances = await prisma.botInstance.findMany({

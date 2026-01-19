@@ -145,6 +145,10 @@ model BotConfig {
   // Dry run mode (quotes only, no execution)
   dryRunMode            Boolean       @default(false)
 
+  // === CAPITAL ALLOCATION ===
+  // Initial USDC capital allocated to this bot (for capital isolation)
+  initialCapitalUSDC    Float?        // null = no capital isolation (uses full wallet)
+
   // === EXECUTION COST & NET EDGE CONFIGURATION ===
   // Minimum net edge required to execute (default 0.40%)
   minimumNetEdgePct     Float         @default(0.40)
@@ -265,6 +269,42 @@ model BotConfig {
   // Dip percentage required to trigger rebuy (default same as buyDipPct)
   rebuyDipPct               Float?
 
+  // === RESERVE RESET CONFIGURATION ===
+  // Enable reserve reset behavior (adaptive 3-bucket strategy)
+  enableReserveReset        Boolean   @default(false)
+
+  // Percentage of allocated capital reserved for resets (default 66%)
+  resetReservePct           Float     @default(66.0)
+
+  // Maximum reserve deployments per cycle before reverting to standard behavior
+  maxReserveDeploymentsPerCycle Int   @default(2)
+
+  // --- Rescue Buy (downside reset) ---
+  // Price drop % from lastBuyPrice to trigger rescue buy
+  rescueTriggerPct          Float     @default(2.5)
+
+  // Percentage of reserve to deploy on rescue (default 50%)
+  rescueDeployPctOfReserve  Float     @default(50.0)
+
+  // Max rescue buys per cycle
+  maxRescueBuysPerCycle     Int       @default(1)
+
+  // Rescue regime gate: NONE, TREND_ONLY, CHAOS_ONLY, TREND_OR_CHAOS
+  rescueRegimeGate          String    @default("TREND_OR_CHAOS")
+
+  // --- Chase Buy (upside reset / participation re-entry) ---
+  // Price rise % above lastSellPrice to trigger chase buy
+  chaseTriggerPct           Float     @default(3.0)
+
+  // Percentage of reserve to deploy on chase (default 33%)
+  chaseDeployPctOfReserve   Float     @default(33.0)
+
+  // Profit target for chase exit (from new basis)
+  chaseExitTargetPct        Float     @default(1.2)
+
+  // Chase regime gate: NONE, TREND_UP_ONLY, TREND_ONLY
+  chaseRegimeGate           String    @default("TREND_UP_ONLY")
+
   // Alerting
   webhookUrl            String?
   discordWebhookUrl     String?
@@ -332,6 +372,19 @@ model BotInstance {
 
   // Timestamp of last rebuy
   lastRebuyAt           DateTime?
+
+  // === CAPITAL ALLOCATION STATE ===
+  // Virtual allocated capital (for multi-bot capital isolation)
+  allocatedUSDC         Float         @default(0)    // Current USDC allocation
+  allocatedSOL          Float         @default(0)    // Current SOL allocation
+
+  // Reserved for pending transactions
+  reservedUSDCForFees   Float         @default(0)    // Reserved for estimated fees
+  pendingBuyUSDC        Float         @default(0)    // USDC locked in pending buys
+  pendingSellSOL        Float         @default(0)    // SOL locked in pending sells
+
+  // Cumulative realized PnL (persisted)
+  cumulativeRealizedPnL Float         @default(0)    // Total lifetime realized PnL
 
   // Safety state
   consecutiveFailures   Int           @default(0)
@@ -543,6 +596,9 @@ enum TradeRejectionReason {
   CAPITAL_TIER_RESTRICTION
   COOLDOWN_ACTIVE
   RATE_LIMIT_EXCEEDED
+  INSUFFICIENT_CAPITAL       // Capital allocation: not enough USDC for BUY
+  SELL_NOT_PROFITABLE        // Capital allocation: SELL would not be profitable (NO L rule)
+  WALLET_GUARDRAIL_FAILED    // Capital allocation: wallet balance insufficient for allocations
 }
 
 // Hourly market analytics for regime detection

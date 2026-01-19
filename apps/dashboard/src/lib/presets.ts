@@ -8,7 +8,7 @@ import type { BotConfig } from './api';
  * Existing configs remain fully backward compatible.
  */
 
-export type PresetId = 'baseline-scale-out' | 'full-exit-scalp' | 'rolling-rebuy-harvest';
+export type PresetId = 'baseline-scale-out' | 'full-exit-scalp' | 'rolling-rebuy-harvest' | 'adaptive-reserve-reset';
 
 export interface StrategyPreset {
   id: PresetId;
@@ -134,12 +134,80 @@ const rollingRebuyHarvest: StrategyPreset = {
 };
 
 /**
+ * Preset D: Adaptive Reserve Reset (3-Bucket)
+ *
+ * Uses pre-allocated reserves to handle large directional days:
+ * - Trading Bucket: ~34% for normal buy/sell cycles
+ * - Rescue Reserve: Deployed on deep dips (2.5%+) to reset cost basis
+ * - Chase Reserve: Deployed on breakouts (3%+) to participate in run-ups
+ *
+ * Key features:
+ * - Rolling rebuy mode with 80% primary sells
+ * - Rescue buys in TREND/CHAOS regimes only
+ * - Chase buys in TREND_UP only (upward trending)
+ * - Chase exits at 1.2% profit target
+ */
+const adaptiveReserveReset: StrategyPreset = {
+  id: 'adaptive-reserve-reset',
+  name: 'Adaptive Reserve Reset (3-Bucket)',
+  shortName: 'Reserve',
+  description: 'Uses 66% reserve for rescue buys (downside) and chase buys (upside) to handle directional days.',
+  config: {
+    // Exit strategy - full exit style
+    exitMode: 'FULL_EXIT',
+    scaleOutSteps: 1,
+
+    // Rolling rebuy cycle mode (required for reserve reset)
+    cycleMode: 'ROLLING_REBUY',
+    primarySellPct: 80,
+    allowRebuy: true,
+    maxRebuyCount: 1,
+    exposureCapPct: 100,
+    rebuyRegimeGate: true,
+    rebuyDipPct: 0.6,
+
+    // Thresholds - MUST MATCH BASELINE
+    buyDipPct: 0.6,
+    sellRisePct: 1.2,
+
+    // Rate limiting - MUST MATCH BASELINE
+    cooldownSeconds: 90,
+    maxTradesPerHour: 6,
+    maxSlippageBps: 50,
+
+    // Sizing - MUST MATCH BASELINE
+    compoundingMode: 'CALCULATED',
+    compoundingReservePct: 7,
+
+    // === RESERVE RESET CONFIGURATION (3-Bucket Strategy) ===
+    enableReserveReset: true,
+    resetReservePct: 66, // 66% in reserve, 34% for trading
+
+    // Rescue buy (downside reset)
+    rescueTriggerPct: 2.5,           // Trigger when price drops 2.5% from lastBuyPrice
+    rescueDeployPctOfReserve: 50,    // Deploy 50% of reserve on rescue
+    maxRescueBuysPerCycle: 1,        // Max 1 rescue per cycle
+    rescueRegimeGate: 'TREND_OR_CHAOS', // Only in trending or volatile markets
+
+    // Chase buy (upside reset)
+    chaseTriggerPct: 3.0,            // Trigger when price rises 3% above lastSellPrice
+    chaseDeployPctOfReserve: 33,     // Deploy 33% of reserve on chase
+    chaseExitTargetPct: 1.2,         // Exit chase at 1.2% profit
+    chaseRegimeGate: 'TREND_UP_ONLY', // Only in upward trends
+
+    // Limit total deployments per cycle
+    maxReserveDeploymentsPerCycle: 2, // Max 2 reserve deployments per cycle
+  },
+};
+
+/**
  * All available presets
  */
 export const STRATEGY_PRESETS: StrategyPreset[] = [
   baselineScaleOut,
   fullExitScalp,
   rollingRebuyHarvest,
+  adaptiveReserveReset,
 ];
 
 /**

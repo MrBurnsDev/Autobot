@@ -1,8 +1,3 @@
-import {
-  JUPITER_QUOTE_ENDPOINT,
-  JUPITER_SWAP_ENDPOINT,
-  JUPITER_API_BASE,
-} from './constants.js';
 import type {
   JupiterQuoteRequest,
   JupiterQuoteResponse,
@@ -18,15 +13,24 @@ export class JupiterClient {
   private apiKey?: string;
 
   constructor(apiBase?: string, apiKey?: string) {
-    this.apiBase = apiBase ?? JUPITER_API_BASE;
+    this.apiBase = apiBase ?? 'https://api.jup.ag/swap/v1';
     this.apiKey = apiKey;
+    logger.info('JupiterClient initialized', {
+      apiBase: this.apiBase,
+      hasApiKey: !!apiKey,
+    });
   }
 
   private getHeaders(): Record<string, string> {
-    const headers: Record<string, string> = { Accept: 'application/json' };
+    const headers: Record<string, string> = {
+      'Accept': 'application/json',
+      'Content-Type': 'application/json',
+    };
+
     if (this.apiKey) {
       headers['x-api-key'] = this.apiKey;
     }
+
     return headers;
   }
 
@@ -34,9 +38,8 @@ export class JupiterClient {
    * Get a quote from Jupiter
    */
   async getQuote(params: JupiterQuoteRequest): Promise<JupiterQuoteResponse> {
-    const url = new URL(this.apiBase + '/quote');
+    const url = new URL(`${this.apiBase}/quote`);
 
-    // Build query params
     url.searchParams.set('inputMint', params.inputMint);
     url.searchParams.set('outputMint', params.outputMint);
     url.searchParams.set('amount', params.amount);
@@ -45,19 +48,15 @@ export class JupiterClient {
     if (params.swapMode) {
       url.searchParams.set('swapMode', params.swapMode);
     }
-
     if (params.dexes && params.dexes.length > 0) {
       url.searchParams.set('dexes', params.dexes.join(','));
     }
-
     if (params.excludeDexes && params.excludeDexes.length > 0) {
       url.searchParams.set('excludeDexes', params.excludeDexes.join(','));
     }
-
     if (params.onlyDirectRoutes) {
       url.searchParams.set('onlyDirectRoutes', 'true');
     }
-
     if (params.restrictIntermediateTokens) {
       url.searchParams.set('restrictIntermediateTokens', 'true');
     }
@@ -66,7 +65,6 @@ export class JupiterClient {
       inputMint: params.inputMint,
       outputMint: params.outputMint,
       amount: params.amount,
-      slippageBps: params.slippageBps,
     });
 
     const response = await retryWithBackoff(
@@ -91,7 +89,6 @@ export class JupiterClient {
         initialDelayMs: 500,
         maxDelayMs: 2000,
         shouldRetry: (err) => {
-          // Retry on network errors and 5xx
           if (err instanceof QuoteError && err.details?.status) {
             const status = err.details.status as number;
             return status >= 500 || status === 429;
@@ -105,7 +102,6 @@ export class JupiterClient {
       inAmount: response.inAmount,
       outAmount: response.outAmount,
       priceImpactPct: response.priceImpactPct,
-      routeCount: response.routePlan.length,
     });
 
     return response;
@@ -115,7 +111,7 @@ export class JupiterClient {
    * Get swap transaction from Jupiter
    */
   async getSwapTransaction(params: JupiterSwapRequest): Promise<JupiterSwapResponse> {
-    const url = this.apiBase + '/swap';
+    const url = `${this.apiBase}/swap`;
 
     logger.debug('Requesting Jupiter swap transaction', {
       userPublicKey: params.userPublicKey,
@@ -126,10 +122,7 @@ export class JupiterClient {
       async () => {
         const res = await fetch(url, {
           method: 'POST',
-          headers: {
-            ...this.getHeaders(),
-            'Content-Type': 'application/json',
-          },
+          headers: this.getHeaders(),
           body: JSON.stringify({
             userPublicKey: params.userPublicKey,
             quoteResponse: params.quoteResponse,
@@ -144,7 +137,7 @@ export class JupiterClient {
 
         if (!res.ok) {
           const errorText = await res.text();
-          throw new RpcError(`Jupiter swap transaction failed: ${res.status} ${errorText}`, {
+          throw new RpcError(`Jupiter swap failed: ${res.status} ${errorText}`, {
             status: res.status,
             body: errorText,
           });
@@ -175,16 +168,15 @@ export class JupiterClient {
   }
 
   /**
-   * Check Jupiter API health
+   * Check Jupiter API health via a minimal quote request
    */
   async checkHealth(): Promise<{ connected: boolean; latencyMs: number }> {
     const start = Date.now();
     try {
-      // Use a minimal quote request to check health
-      const testUrl = new URL(this.apiBase + '/quote');
+      const testUrl = new URL(`${this.apiBase}/quote`);
       testUrl.searchParams.set('inputMint', 'So11111111111111111111111111111111111111112');
       testUrl.searchParams.set('outputMint', 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v');
-      testUrl.searchParams.set('amount', '1000000'); // 0.001 SOL
+      testUrl.searchParams.set('amount', '1000000');
       testUrl.searchParams.set('slippageBps', '50');
 
       const res = await fetch(testUrl.toString(), {

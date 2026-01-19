@@ -52,6 +52,22 @@ const CreateConfigSchema = z.object({
   exposureCapPct: z.number().min(20).max(100).default(50),
   rebuyRegimeGate: z.boolean().default(true),
   rebuyDipPct: z.number().min(0.1).max(50).nullable().optional(),
+  // Capital allocation
+  initialCapitalUSDC: z.number().positive().nullable().optional(),
+  // Reserve reset settings (3-bucket adaptive strategy)
+  enableReserveReset: z.boolean().default(false),
+  resetReservePct: z.number().min(10).max(90).default(66),
+  maxReserveDeploymentsPerCycle: z.number().int().min(1).max(5).default(2),
+  // Rescue buy (downside reset)
+  rescueTriggerPct: z.number().min(0.5).max(20).default(2.5),
+  rescueDeployPctOfReserve: z.number().min(10).max(100).default(50),
+  maxRescueBuysPerCycle: z.number().int().min(1).max(3).default(1),
+  rescueRegimeGate: z.enum(['NONE', 'TREND_ONLY', 'CHAOS_ONLY', 'TREND_OR_CHAOS']).default('TREND_OR_CHAOS'),
+  // Chase buy (upside reset)
+  chaseTriggerPct: z.number().min(0.5).max(20).default(3.0),
+  chaseDeployPctOfReserve: z.number().min(10).max(100).default(33),
+  chaseExitTargetPct: z.number().min(0.5).max(10).default(1.2),
+  chaseRegimeGate: z.enum(['NONE', 'TREND_UP_ONLY', 'TREND_ONLY']).default('TREND_UP_ONLY'),
 });
 
 const UpdateConfigSchema = CreateConfigSchema.partial();

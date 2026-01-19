@@ -15,8 +15,9 @@ const envSchema = z.object({
   // Solana
   SOLANA_RPC_URL: z.string().default('https://api.mainnet-beta.solana.com'),
   SOLANA_PRIVATE_KEY_BASE58: z.string().optional(),
+  // Jupiter API - get key from https://station.jup.ag
   JUPITER_API_BASE: z.string().default('https://api.jup.ag/swap/v1'),
-  JUPITER_API_KEY: z.string().optional(), // Get free key at https://station.jup.ag/docs/apis/api-keys
+  JUPITER_API_KEY: z.string().optional(),
   SOLANA_PRIORITY_FEE_MICRO_LAMPORTS: z.string().default('1000'),
 
   // Avalanche

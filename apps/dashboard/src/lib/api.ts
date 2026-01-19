@@ -50,6 +50,22 @@ export interface BotConfig {
   exposureCapPct: number;
   rebuyRegimeGate: boolean;
   rebuyDipPct: number | null;
+  // Capital allocation
+  initialCapitalUSDC: number | null;
+  // Reserve reset configuration (3-bucket adaptive strategy)
+  enableReserveReset: boolean;
+  resetReservePct: number;
+  maxReserveDeploymentsPerCycle: number;
+  // Rescue buy (downside reset)
+  rescueTriggerPct: number;
+  rescueDeployPctOfReserve: number;
+  maxRescueBuysPerCycle: number;
+  rescueRegimeGate: 'NONE' | 'TREND_ONLY' | 'CHAOS_ONLY' | 'TREND_OR_CHAOS';
+  // Chase buy (upside reset)
+  chaseTriggerPct: number;
+  chaseDeployPctOfReserve: number;
+  chaseExitTargetPct: number;
+  chaseRegimeGate: 'NONE' | 'TREND_UP_ONLY' | 'TREND_ONLY';
   createdAt: string;
   updatedAt: string;
 }
@@ -81,6 +97,13 @@ export interface BotInstance {
   extensionPeakPrice?: number | null;
   extensionStartedAt?: string | null;
   extensionPrimaryPnl?: number;
+  // Capital allocation state
+  allocatedUSDC?: number;
+  allocatedSOL?: number;
+  reservedUSDCForFees?: number;
+  pendingBuyUSDC?: number;
+  pendingSellSOL?: number;
+  cumulativeRealizedPnL?: number;
 }
 
 export interface BotStatus {

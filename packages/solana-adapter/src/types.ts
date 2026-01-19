@@ -92,7 +92,7 @@ export interface SolanaAdapterConfig {
   rpcUrl: string;
   privateKeyBase58: string;
   jupiterApiBase?: string;
-  jupiterApiKey?: string; // API key from https://station.jup.ag/docs/apis/api-keys
+  jupiterApiKey?: string; // API key from https://station.jup.ag
   priorityFeeMicroLamports?: number;
   useVersionedTransactions?: boolean;
   confirmationCommitment?: 'processed' | 'confirmed' | 'finalized';
@@ -120,4 +120,31 @@ export interface TokenBalance {
   };
   owner?: string;
   programId?: string;
+}
+
+// D3fenders Swap API response wrappers
+export interface D3fendersQuoteResponse {
+  success: boolean;
+  data: JupiterQuoteResponse;
+  fee?: {
+    enabled: boolean;
+    bps: number;
+    percentage: string;
+    estimatedLamports: string;
+    estimatedSol: string;
+    treasury: string;
+  };
+}
+
+export interface D3fendersBuildResponse {
+  success: boolean;
+  data: JupiterSwapResponse;
+  fee?: {
+    enabled: boolean;
+    bps: number;
+    percentage: string;
+    estimatedLamports: string;
+    estimatedSol: string;
+    treasury: string;
+  };
 }

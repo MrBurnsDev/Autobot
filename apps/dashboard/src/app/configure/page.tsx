@@ -73,6 +73,20 @@ const defaultConfig = {
   exposureCapPct: 50,
   rebuyRegimeGate: true,
   rebuyDipPct: null as number | null,
+  // Capital allocation
+  initialCapitalUSDC: null as number | null,
+  // Reserve reset settings (3-bucket adaptive strategy)
+  enableReserveReset: false,
+  resetReservePct: 66,
+  maxReserveDeploymentsPerCycle: 2,
+  rescueTriggerPct: 2.5,
+  rescueDeployPctOfReserve: 50,
+  maxRescueBuysPerCycle: 1,
+  rescueRegimeGate: 'TREND_OR_CHAOS' as 'NONE' | 'TREND_ONLY' | 'CHAOS_ONLY' | 'TREND_OR_CHAOS',
+  chaseTriggerPct: 3.0,
+  chaseDeployPctOfReserve: 33,
+  chaseExitTargetPct: 1.2,
+  chaseRegimeGate: 'TREND_UP_ONLY' as 'NONE' | 'TREND_UP_ONLY' | 'TREND_ONLY',
 };
 
 export default function ConfigurePage() {
@@ -753,6 +767,56 @@ export default function ConfigurePage() {
           </>
         )}
       </div>
+
+      {/* Capital Allocation */}
+      <div className="space-y-4 md:col-span-2 p-4 bg-secondary/30 rounded-lg border border-border">
+        <h4 className="font-medium">Capital Allocation (Optional)</h4>
+        <p className="text-sm text-muted-foreground">
+          Enable capital isolation to run multiple bots from a single wallet without conflicts
+        </p>
+
+        <div>
+          <label className="block text-sm font-medium mb-1">
+            Initial Capital Allocation (USDC)
+          </label>
+          <input
+            type="number"
+            value={formData.initialCapitalUSDC ?? ''}
+            onChange={(e) => {
+              const value = e.target.value;
+              setFormData({
+                ...formData,
+                initialCapitalUSDC: value ? parseFloat(value) : null,
+              });
+            }}
+            className="w-full rounded-md border border-border bg-secondary p-2"
+            placeholder="Leave empty to use full wallet (legacy mode)"
+            min="0.01"
+            step="0.01"
+          />
+          <p className="text-xs text-muted-foreground mt-1">
+            The virtual USDC balance this bot can trade with. Leave empty to use full wallet balance.
+          </p>
+        </div>
+
+        {formData.initialCapitalUSDC !== null && formData.initialCapitalUSDC > 0 && (
+          <div className="p-3 rounded-md bg-primary/10 border border-primary/20">
+            <p className="text-sm text-primary">
+              <strong>Capital Isolation Enabled:</strong> This bot will only trade using its allocated ${formData.initialCapitalUSDC.toFixed(2)} USDC.
+              Ensure your wallet has sufficient balance before starting multiple bots.
+            </p>
+          </div>
+        )}
+
+        {formData.initialCapitalUSDC !== null && formData.initialCapitalUSDC > 0 && formData.initialCapitalUSDC < 5 && (
+          <div className="p-3 rounded-md bg-yellow-400/10 border border-yellow-400/20">
+            <p className="text-sm text-yellow-500">
+              <strong>Warning:</strong> Allocated capital of ${formData.initialCapitalUSDC.toFixed(2)} is unusually low.
+              Consider allocating at least $5 USDC for effective trading.
+            </p>
+          </div>
+        )}
+      </div>
       </div>
     </div>
   );
@@ -831,6 +895,11 @@ export default function ConfigurePage() {
                           DRY RUN
                         </span>
                       )}
+                      {config.initialCapitalUSDC && (
+                        <span className="px-2 py-0.5 rounded text-xs bg-primary/20 text-primary">
+                          ${config.initialCapitalUSDC} allocated
+                        </span>
+                      )}
                     </div>
                     <div className="text-sm text-muted-foreground mt-1 space-x-4">
                       <span>Buy dip: {config.buyDipPct}%</span>
@@ -893,6 +962,20 @@ export default function ConfigurePage() {
                           exposureCapPct: config.exposureCapPct ?? 50,
                           rebuyRegimeGate: config.rebuyRegimeGate ?? true,
                           rebuyDipPct: config.rebuyDipPct,
+                          // Capital allocation
+                          initialCapitalUSDC: config.initialCapitalUSDC,
+                          // Reserve reset settings
+                          enableReserveReset: config.enableReserveReset ?? false,
+                          resetReservePct: config.resetReservePct ?? 66,
+                          maxReserveDeploymentsPerCycle: config.maxReserveDeploymentsPerCycle ?? 2,
+                          rescueTriggerPct: config.rescueTriggerPct ?? 2.5,
+                          rescueDeployPctOfReserve: config.rescueDeployPctOfReserve ?? 50,
+                          maxRescueBuysPerCycle: config.maxRescueBuysPerCycle ?? 1,
+                          rescueRegimeGate: config.rescueRegimeGate ?? 'TREND_OR_CHAOS',
+                          chaseTriggerPct: config.chaseTriggerPct ?? 3.0,
+                          chaseDeployPctOfReserve: config.chaseDeployPctOfReserve ?? 33,
+                          chaseExitTargetPct: config.chaseExitTargetPct ?? 1.2,
+                          chaseRegimeGate: config.chaseRegimeGate ?? 'TREND_UP_ONLY',
                         });
                       }}
                     >

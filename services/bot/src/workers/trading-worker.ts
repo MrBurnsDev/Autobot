@@ -49,9 +49,23 @@ import {
   type CompoundingConfig,
   type CompoundingMode,
   type TradeSizeResult,
+  // Capital allocation
+  formatCapitalCheckLog,
+  formatWalletGuardrailLog,
+  type TradePlan,
 } from '@autobot/core';
 import { getAdapter } from '../services/adapter-factory.js';
 import { AlertService } from '../services/alert-service.js';
+import {
+  initializeBotCapital,
+  checkTradeAllowed,
+  reserveCapitalForTrade,
+  settleTransaction,
+  updateUnrealizedPnL,
+  checkWalletGuardrail,
+  isCapitalIsolationEnabled,
+  removeAllocation,
+} from '../services/capital-service.js';
 import { config } from '../config.js';
 
 const logger = new Logger('TradingWorker');
@@ -117,6 +131,16 @@ export async function startWorker(instanceId: string): Promise<void> {
   };
   workers.set(instanceId, workerState);
 
+  // Initialize capital allocation if enabled
+  const capitalState = await initializeBotCapital(instanceId);
+  if (capitalState) {
+    logger.info('Capital isolation enabled', {
+      instanceId,
+      allocatedUSDC: capitalState.allocatedUSDC,
+      allocatedSOL: capitalState.allocatedSOL,
+    });
+  }
+
   // Update instance status
   await prisma.botInstance.update({
     where: { id: instanceId },
@@ -158,6 +182,9 @@ export async function stopWorker(instanceId: string, reason?: string): Promise<v
     clearTimeout(workerState.loopHandle);
   }
   workers.delete(instanceId);
+
+  // Remove capital allocation from in-memory state (persisted data remains in DB)
+  removeAllocation(instanceId);
 
   // Update instance status
   const instance = await prisma.botInstance.update({
@@ -412,6 +439,39 @@ async function executeTradingCycle(instanceId: string, workerState: WorkerState)
   const currentPrice = discoveryQuote.price;
   const portfolioValueUsdc = balances.base * currentPrice + balances.quote;
 
+  // === WALLET-LEVEL GUARDRAIL ===
+  // Check that sum of all bot allocations doesn't exceed actual wallet balance
+  const capitalEnabled = await isCapitalIsolationEnabled(instanceId);
+  if (capitalEnabled) {
+    const guardrailResult = checkWalletGuardrail(balances.quote, balances.base);
+
+    if (!guardrailResult.safe) {
+      logger.error('Wallet guardrail FAILED', {
+        instanceId,
+        log: formatWalletGuardrailLog(guardrailResult),
+      });
+
+      // Log rejection and pause bot
+      await logTradeRejection(instanceId, 'BUY', 'WALLET_GUARDRAIL_FAILED', {
+        intendedSizeUsdc: 0,
+        currentPrice,
+        portfolioValueUsdc,
+        currentRegime: workerState.currentRegime,
+      });
+
+      await pauseBot(instanceId, `Wallet guardrail failed: ${guardrailResult.reason}`, botConfig);
+      return;
+    }
+
+    // Update unrealized PnL for this bot
+    updateUnrealizedPnL(instanceId, currentPrice);
+
+    logger.debug('Wallet guardrail passed', {
+      instanceId,
+      log: formatWalletGuardrailLog(guardrailResult),
+    });
+  }
+
   // === REGIME CLASSIFICATION ===
   // Check regime periodically (every hour)
   const now = new Date();
@@ -641,6 +701,55 @@ async function executeTradeWithCostGating(
       netEdge: costResult.netEdgePct,
     });
     return;
+  }
+
+  // === CAPITAL ALLOCATION CHECK (if enabled) ===
+  const capitalEnabled = await isCapitalIsolationEnabled(instanceId);
+  if (capitalEnabled) {
+    // Estimate fee in USDC
+    const estimatedFeeUSDC =
+      (costResult.estimatedDexFeePct + costResult.priorityFeeImpactPct) * amount / 100;
+
+    const tradePlan: TradePlan = {
+      side,
+      quoteAmount: side === 'BUY' ? quote.inputAmount : quote.outputAmount,
+      baseAmount: side === 'BUY' ? quote.outputAmount : quote.inputAmount,
+      estimatedFeeUSDC,
+      currentPrice,
+    };
+
+    const capitalCheck = checkTradeAllowed(instanceId, tradePlan);
+    logger.info('Capital allocation check', {
+      instanceId,
+      log: formatCapitalCheckLog(capitalCheck),
+    });
+
+    if (!capitalCheck.allowed) {
+      // Determine rejection reason
+      const rejectionReason: TradeRejectionReason =
+        side === 'BUY' ? 'INSUFFICIENT_CAPITAL' : 'SELL_NOT_PROFITABLE';
+
+      await logTradeRejection(instanceId, side, rejectionReason, {
+        intendedSizeUsdc: amount,
+        currentPrice,
+        portfolioValueUsdc,
+        currentRegime,
+      });
+
+      logger.warn('Trade rejected by capital allocation', {
+        instanceId,
+        clientOrderId,
+        reason: capitalCheck.reason,
+        side,
+      });
+      return;
+    }
+
+    // Reserve capital before execution
+    if (!await reserveCapitalForTrade(instanceId, tradePlan)) {
+      logger.error('Failed to reserve capital', { instanceId, clientOrderId });
+      return;
+    }
   }
 
   // === APPLY REGIME-BASED ADJUSTMENTS ===
@@ -1024,6 +1133,33 @@ async function processSuccessfulFill(
 
   // Update instance state
   await updateInstanceAfterFill(instanceId, side, fill, realizedPnl, pnlCalculator, instance);
+
+  // Settle capital allocation (if enabled)
+  const capitalEnabled = await isCapitalIsolationEnabled(instanceId);
+  if (capitalEnabled) {
+    const tradePlan: TradePlan = {
+      side,
+      quoteAmount: fill.quoteQty,
+      baseAmount: fill.baseQty,
+      estimatedFeeUSDC: result.feeNativeUsdc,
+      currentPrice: result.executedPrice,
+    };
+
+    await settleTransaction(instanceId, tradePlan, {
+      success: true,
+      actualQuoteAmount: fill.quoteQty,
+      actualBaseAmount: fill.baseQty,
+      actualFeeUSDC: result.feeNativeUsdc,
+      realizedPnL: realizedPnl,
+    });
+
+    logger.debug('Capital settlement completed', {
+      instanceId,
+      side,
+      quoteAmount: fill.quoteQty,
+      baseAmount: fill.baseQty,
+    });
+  }
 
   // Send alert
   const alertService = new AlertService(

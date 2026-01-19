@@ -62,3 +62,31 @@ export {
   type CompoundingConfig,
   type TradeSizeResult,
 } from './compounding-calculator.js';
+
+// Capital allocation and isolation
+export {
+  CapitalAllocator,
+  formatCapitalCheckLog,
+  formatWalletGuardrailLog,
+  DEFAULT_CAPITAL_ALLOCATOR_CONFIG,
+  type BotCapitalState,
+  type TradePlan,
+  type CapitalCheckResult,
+  type WalletGuardrailResult,
+  type CapitalAllocatorConfig,
+} from './capital-allocator.js';
+
+// Reserve reset manager (3-bucket adaptive strategy)
+export {
+  ReserveResetManager,
+  formatReserveResetLog,
+  formatReserveStateLog,
+  DEFAULT_RESERVE_RESET_CONFIG,
+  type RescueRegimeGate,
+  type ChaseRegimeGate,
+  type ReserveResetConfig,
+  type ReserveState,
+  type ReserveResetAction,
+  type ReserveResetDecision,
+  type ReserveResetContext,
+} from './reserve-reset-manager.js';
