@@ -94,6 +94,18 @@ enum ExtensionState {
   TRAILING      // Trailing stop activated (if enabled)
 }
 
+// Runner mode for two-leg position model
+enum RunnerMode {
+  LADDER        // Exit in multiple steps at fixed targets
+  TRAILING      // Exit via trailing stop after activation
+}
+
+// Runner state for two-leg position model
+enum RunnerState {
+  NONE          // No runner leg active
+  ACTIVE        // Runner is holding and monitoring
+}
+
 // Bot configuration - stores all user-configurable parameters
 model BotConfig {
   id                    String        @id @default(cuid())
@@ -305,6 +317,33 @@ model BotConfig {
   // Chase regime gate: NONE, TREND_UP_ONLY, TREND_ONLY
   chaseRegimeGate           String    @default("TREND_UP_ONLY")
 
+  // === RUNNER (TWO-LEG POSITION MODEL) ===
+  // Enable runner leg for remaining position after CORE sell
+  runnerEnabled             Boolean   @default(false)
+
+  // Percentage allocated to runner (default 20%, must equal 100 - primarySellPct)
+  runnerPct                 Float     @default(20.0)
+
+  // Runner exit mode: LADDER (fixed targets) or TRAILING (trail from peak)
+  runnerMode                RunnerMode @default(TRAILING)
+
+  // --- Ladder mode configuration ---
+  // Target percentages above entry for each ladder step (e.g., [2.5, 4.0])
+  runnerLadderTargets       Float[]   @default([])
+
+  // Percentage of runner to sell at each ladder step (must sum to 100)
+  runnerLadderPercents      Float[]   @default([])
+
+  // --- Trailing mode configuration ---
+  // Price rise % above runner entry to activate trailing (default 1.8%)
+  runnerTrailActivatePct    Float     @default(1.8)
+
+  // Pullback % from peak to trigger exit (default 0.7%)
+  runnerTrailStopPct        Float     @default(0.7)
+
+  // Minimum dollar profit required to exit runner (optional filter)
+  runnerMinDollarProfit     Float     @default(0.0)
+
   // Alerting
   webhookUrl            String?
   discordWebhookUrl     String?
@@ -372,6 +411,28 @@ model BotInstance {
 
   // Timestamp of last rebuy
   lastRebuyAt           DateTime?
+
+  // === RUNNER LEG STATE (TWO-LEG POSITION MODEL) ===
+  // Current runner state: NONE or ACTIVE
+  runnerState           RunnerState   @default(NONE)
+
+  // Quantity held in runner leg (separate from CORE)
+  runnerQty             Float         @default(0)
+
+  // Cost basis for runner leg (for PnL calculation)
+  runnerCostBasis       Float         @default(0)
+
+  // Entry price when runner was created (from CORE sell moment)
+  runnerEntryPrice      Float?
+
+  // Peak price since runner became active (for trailing)
+  runnerPeakPrice       Float?
+
+  // Timestamp when runner leg was created
+  runnerStartedAt       DateTime?
+
+  // Ladder steps completed (for LADDER mode)
+  runnerLadderStep      Int           @default(0)
 
   // === CAPITAL ALLOCATION STATE ===
   // Virtual allocated capital (for multi-bot capital isolation)

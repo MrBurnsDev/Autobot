@@ -68,7 +68,52 @@ const CreateConfigSchema = z.object({
   chaseDeployPctOfReserve: z.number().min(10).max(100).default(33),
   chaseExitTargetPct: z.number().min(0.5).max(10).default(1.2),
   chaseRegimeGate: z.enum(['NONE', 'TREND_UP_ONLY', 'TREND_ONLY']).default('TREND_UP_ONLY'),
+  // Runner (two-leg position model)
+  runnerEnabled: z.boolean().default(false),
+  runnerPct: z.number().min(1).max(50).default(20),
+  runnerMode: z.enum(['LADDER', 'TRAILING']).default('TRAILING'),
+  runnerLadderTargets: z.array(z.number().min(0.1).max(50)).default([]),
+  runnerLadderPercents: z.array(z.number().min(1).max(100)).default([]),
+  runnerTrailActivatePct: z.number().min(0.1).max(20).default(1.8),
+  runnerTrailStopPct: z.number().min(0.1).max(10).default(0.7),
+  runnerMinDollarProfit: z.number().min(0).default(0),
 });
+
+// Helper to validate runner configuration
+function validateRunnerConfig(data: Record<string, unknown>): boolean {
+  // Skip validation if runner is not enabled or fields missing
+  if (!data.runnerEnabled) return true;
+
+  // Validate runnerPct + primarySellPct = 100 when runner is enabled
+  const primarySellPct = typeof data.primarySellPct === 'number' ? data.primarySellPct : 80;
+  const runnerPct = typeof data.runnerPct === 'number' ? data.runnerPct : 20;
+  const sum = primarySellPct + runnerPct;
+  if (Math.abs(sum - 100) > 0.01) {
+    throw new Error('primarySellPct + runnerPct must equal 100 when runner is enabled');
+  }
+
+  // Validate ladder arrays when in LADDER mode
+  if (data.runnerMode === 'LADDER') {
+    const targets = Array.isArray(data.runnerLadderTargets) ? data.runnerLadderTargets : [];
+    const percents = Array.isArray(data.runnerLadderPercents) ? data.runnerLadderPercents : [];
+    if (targets.length !== percents.length) {
+      throw new Error('Ladder targets and percents arrays must have same length');
+    }
+    if (targets.length > 0) {
+      const percentSum = percents.reduce((a: number, b: number) => a + b, 0);
+      if (Math.abs(percentSum - 100) > 0.01) {
+        throw new Error('Ladder percents must sum to 100');
+      }
+      for (let i = 1; i < targets.length; i++) {
+        if (targets[i] <= targets[i - 1]) {
+          throw new Error('Ladder targets must be strictly increasing');
+        }
+      }
+    }
+  }
+
+  return true;
+}
 
 const UpdateConfigSchema = CreateConfigSchema.partial();
 
@@ -109,6 +154,9 @@ export const configRoutes: FastifyPluginAsync = async (fastify) => {
   fastify.post<{ Body: z.infer<typeof CreateConfigSchema> }>('/configs', async (request, reply) => {
     const data = CreateConfigSchema.parse(request.body);
 
+    // Validate runner configuration
+    validateRunnerConfig(data);
+
     // Set default mints based on chain
     const baseMint =
       data.baseMint ??
@@ -142,6 +190,12 @@ export const configRoutes: FastifyPluginAsync = async (fastify) => {
       const existing = await prisma.botConfig.findUnique({
         where: { id: request.params.id },
       });
+
+      // Validate runner configuration (merge with existing for complete validation)
+      if (existing) {
+        const merged = { ...existing, ...data };
+        validateRunnerConfig(merged as Record<string, unknown>);
+      }
 
       if (!existing) {
         return reply.notFound('Config not found');

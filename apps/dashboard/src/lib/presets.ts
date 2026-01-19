@@ -8,7 +8,7 @@ import type { BotConfig } from './api';
  * Existing configs remain fully backward compatible.
  */
 
-export type PresetId = 'baseline-scale-out' | 'full-exit-scalp' | 'rolling-rebuy-harvest' | 'adaptive-reserve-reset';
+export type PresetId = 'baseline-scale-out' | 'full-exit-scalp' | 'rolling-rebuy-harvest' | 'adaptive-reserve-reset' | 'best-roi-velocity';
 
 export interface StrategyPreset {
   id: PresetId;
@@ -136,23 +136,30 @@ const rollingRebuyHarvest: StrategyPreset = {
 /**
  * Preset D: Adaptive Reserve Reset (3-Bucket)
  *
- * Uses pre-allocated reserves to handle large directional days:
+ * Designed to prevent being stuck on large directional days while preserving profit-only exits.
+ *
+ * Uses pre-allocated reserves to handle large up-only and down-only days:
  * - Trading Bucket: ~34% for normal buy/sell cycles
  * - Rescue Reserve: Deployed on deep dips (2.5%+) to reset cost basis
  * - Chase Reserve: Deployed on breakouts (3%+) to participate in run-ups
  *
- * Key features:
- * - Rolling rebuy mode with 80% primary sells
- * - Rescue buys in TREND/CHAOS regimes only
- * - Chase buys in TREND_UP only (upward trending)
- * - Chase exits at 1.2% profit target
+ * Key constraints:
+ * - Profit-only sells (net-profit guard enforced)
+ * - No forced stop-loss behavior
+ * - Capital isolation per bot
+ * - Rolling rebuy + reserve reset logic
+ * - No ML, no prediction
  */
 const adaptiveReserveReset: StrategyPreset = {
   id: 'adaptive-reserve-reset',
   name: 'Adaptive Reserve Reset (3-Bucket)',
   shortName: 'Reserve',
-  description: 'Uses 66% reserve for rescue buys (downside) and chase buys (upside) to handle directional days.',
+  description: 'Designed to prevent being stuck on large directional days while preserving profit-only exits.',
   config: {
+    // Thresholds
+    buyDipPct: 0.6,
+    sellRisePct: 1.2,
+
     // Exit strategy - full exit style
     exitMode: 'FULL_EXIT',
     scaleOutSteps: 1,
@@ -166,18 +173,17 @@ const adaptiveReserveReset: StrategyPreset = {
     rebuyRegimeGate: true,
     rebuyDipPct: 0.6,
 
-    // Thresholds - MUST MATCH BASELINE
-    buyDipPct: 0.6,
-    sellRisePct: 1.2,
-
-    // Rate limiting - MUST MATCH BASELINE
+    // Rate limiting
     cooldownSeconds: 90,
     maxTradesPerHour: 6,
     maxSlippageBps: 50,
 
-    // Sizing - MUST MATCH BASELINE
+    // Sizing
     compoundingMode: 'CALCULATED',
     compoundingReservePct: 7,
+
+    // No daily loss limit interference - set extremely high
+    dailyLossLimitUsdc: null,
 
     // === RESERVE RESET CONFIGURATION (3-Bucket Strategy) ===
     enableReserveReset: true,
@@ -201,9 +207,96 @@ const adaptiveReserveReset: StrategyPreset = {
 };
 
 /**
+ * Preset E: Best ROI (Velocity)
+ *
+ * High-velocity profit harvesting with profit-only exits.
+ * Optimized for realistic ROI through frequent, net-profitable trades.
+ *
+ * Key characteristics:
+ * - NOT a trend-hold bot - prioritizes frequent exits over large % moves
+ * - 1.2% sell rise clears fees while maximizing capital velocity
+ * - 0.6% dip matches real SOL intraday volatility
+ * - 80% sell ensures frequent capital recycling
+ * - Run-pullback rebuy prevents idle capital during strong trends
+ * - Reserve reset prevents getting stuck on directional days
+ * - High maxTradesPerHour (60) as safety guardrail, not strategy limiter
+ *
+ * Designed for $400 initial capital with natural compounding.
+ */
+const bestRoiVelocity: StrategyPreset = {
+  id: 'best-roi-velocity',
+  name: 'Best ROI (Velocity)',
+  shortName: 'Velocity',
+  description: 'High-velocity profit harvesting with profit-only exits. Optimized for realistic ROI, not long holds.',
+  config: {
+    // Chain
+    chain: 'SOLANA',
+
+    // Strategy thresholds
+    buyDipPct: 0.6,
+    sellRisePct: 1.2,
+
+    // Trade sizing
+    compoundingMode: 'CALCULATED',
+    initialTradeSizeUsdc: 100,
+    compoundingReservePct: 7,
+
+    // Safety controls
+    maxSlippageBps: 50,
+    cooldownSeconds: 60,
+    maxTradesPerHour: 60, // High ceiling - safety guardrail only
+    dailyLossLimitUsdc: null, // Disabled - profit-only sells, no interference
+
+    // Execution
+    dryRunMode: false,
+
+    // Exit strategy - full exit, no scale-out
+    exitMode: 'FULL_EXIT',
+    scaleOutSteps: 1,
+
+    // Liquidity sources
+    allowedSources: ['Orca', 'Raydium', 'Meteora', 'Phoenix', 'Lifinity', 'Openbook'],
+
+    // Cycle mode - rolling rebuy for capital velocity
+    cycleMode: 'ROLLING_REBUY',
+    primarySellPct: 80,
+    allowRebuy: true,
+    rebuyDipPct: 0.6,
+    maxRebuyCount: 1,
+    exposureCapPct: 100,
+    rebuyRegimeGate: true,
+
+    // Runner (two-leg position model)
+    // After CORE sell (80%), the remaining 20% becomes a RUNNER leg
+    // Runner exits independently via trailing stop, doesn't block CORE trading
+    runnerEnabled: true,
+    runnerPct: 20, // primarySellPct + runnerPct = 100
+    runnerMode: 'TRAILING',
+    runnerTrailActivatePct: 1.8, // Start trailing after 1.8% profit
+    runnerTrailStopPct: 0.7, // Exit on 0.7% pullback from peak
+    runnerMinDollarProfit: 0.10, // Minimum $0.10 profit to exit (avoid dust)
+
+    // Reserve reset (directional safety)
+    enableReserveReset: true,
+    resetReservePct: 66,
+    rescueTriggerPct: 2.5,
+    rescueDeployPctOfReserve: 50,
+    maxRescueBuysPerCycle: 1,
+    chaseTriggerPct: 3.0,
+    chaseDeployPctOfReserve: 33,
+    chaseExitTargetPct: 1.2,
+    maxReserveDeploymentsPerCycle: 2,
+
+    // Capital isolation
+    initialCapitalUSDC: 400.03,
+  },
+};
+
+/**
  * All available presets
  */
 export const STRATEGY_PRESETS: StrategyPreset[] = [
+  bestRoiVelocity,
   baselineScaleOut,
   fullExitScalp,
   rollingRebuyHarvest,

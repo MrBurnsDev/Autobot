@@ -90,3 +90,16 @@ export {
   type ReserveResetDecision,
   type ReserveResetContext,
 } from './reserve-reset-manager.js';
+
+// Runner manager (two-leg position model: CORE + RUNNER)
+export {
+  RunnerManager,
+  formatRunnerLog,
+  DEFAULT_RUNNER_CONFIG,
+  type RunnerMode,
+  type RunnerState,
+  type RunnerConfig,
+  type RunnerStateData,
+  type RunnerDecision,
+  type RunnerContext,
+} from './runner-manager.js';

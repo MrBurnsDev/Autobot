@@ -42,6 +42,10 @@ services:
     dns:
       - 8.8.8.8
       - 8.8.4.4
+    extra_hosts:
+      - "api.jup.ag:18.161.34.26"
+      - "mainnet.helius-rpc.com:172.64.151.87"
+      - "binaries.prisma.sh:104.20.43.103"
     depends_on:
       postgres:
         condition: service_healthy

@@ -9,6 +9,7 @@ import {
   TradeRejectionReason,
   ExitMode,
   ExtensionState,
+  RunnerState,
 } from '@autobot/db';
 import {
   TradingStrategy,
@@ -43,6 +44,12 @@ import {
   type ScaleOutConfig,
   type ExtensionStateData,
   type ScaleOutDecision,
+  // Runner (two-leg position model)
+  RunnerManager,
+  formatRunnerLog,
+  type RunnerConfig,
+  type RunnerStateData,
+  type RunnerDecision,
   // Compounding modules
   CompoundingCalculator,
   formatCompoundingLog,
@@ -525,6 +532,30 @@ async function executeTradingCycle(instanceId: string, workerState: WorkerState)
       await maybeSnapshotPosition(instanceId, balances, currentPrice);
       return; // Don't proceed to normal strategy evaluation
     }
+  }
+
+  // === RUNNER LEG CHECK ===
+  // If runner leg is active, check for runner exit (independent of CORE strategy)
+  if (instance.runnerState === 'ACTIVE' && botConfig.runnerEnabled) {
+    const runnerHandled = await checkRunnerExit(
+      instanceId,
+      instance,
+      adapter,
+      botConfig,
+      pnlCalculator,
+      costCalculator,
+      currentPrice,
+      portfolioValueUsdc,
+      discoveryQuote
+    );
+
+    // Update runner peak price even if not exiting
+    if (instance.runnerState === 'ACTIVE') {
+      await updateRunnerPeakPrice(instanceId, instance, currentPrice);
+    }
+
+    // Runner exit does NOT block CORE strategy - CORE can continue trading
+    // This is the key difference from extension: runner is independent
   }
 
   // Build strategy state
@@ -1918,18 +1949,34 @@ async function executeSellWithScaleOut(
 
   switch (scaleOutDecision.action) {
     case 'FULL_EXIT':
-      // Use existing trade execution for full exit
-      await executeTradeWithCostGating(
-        instanceId,
-        action,
-        adapter,
-        botConfig,
-        pnlCalculator,
-        costCalculator,
-        currentPrice,
-        portfolioValueUsdc,
-        currentRegime
-      );
+      // Check if runner should be created instead of full exit
+      if (botConfig.runnerEnabled && instance.runnerState === 'NONE' && instance.totalBaseQty > 0) {
+        // Execute partial CORE sell and create runner
+        await executeCoreExitWithRunner(
+          instanceId,
+          action,
+          instance,
+          adapter,
+          botConfig,
+          pnlCalculator,
+          costCalculator,
+          currentPrice,
+          portfolioValueUsdc
+        );
+      } else {
+        // Standard full exit (no runner)
+        await executeTradeWithCostGating(
+          instanceId,
+          action,
+          adapter,
+          botConfig,
+          pnlCalculator,
+          costCalculator,
+          currentPrice,
+          portfolioValueUsdc,
+          currentRegime
+        );
+      }
       break;
 
     case 'PRIMARY_EXIT':
@@ -2249,6 +2296,294 @@ async function executePrimaryExit(
     extensionQty: decision.extensionQty,
     extensionCost: decision.extensionCost,
     splitExecution: tierResult.shouldSplit,
+  });
+}
+
+/**
+ * Execute CORE exit with runner creation (two-leg position model)
+ * Sells primarySellPct (80%) of position and creates runner with runnerPct (20%)
+ */
+async function executeCoreExitWithRunner(
+  instanceId: string,
+  action: StrategyAction & { type: 'SELL' },
+  instance: BotInstance,
+  adapter: ChainAdapter,
+  botConfig: BotConfig,
+  pnlCalculator: PnLCalculator,
+  costCalculator: ExecutionCostCalculator,
+  currentPrice: number,
+  portfolioValueUsdc: number
+): Promise<void> {
+  const side: TradeSide = 'SELL';
+  const clientOrderId = generateClientOrderId(instanceId, `CORE_${side}`, Date.now());
+
+  // Check for duplicate
+  const existing = await prisma.tradeAttempt.findUnique({
+    where: { clientOrderId },
+  });
+  if (existing) {
+    logger.warn('Duplicate CORE order detected', { clientOrderId });
+    return;
+  }
+
+  // Calculate CORE (primary) and RUNNER portions
+  const totalBaseQty = instance.totalBaseQty;
+  const totalBaseCost = instance.totalBaseCost;
+  const primaryPct = botConfig.primarySellPct / 100; // e.g., 80 -> 0.80
+  const runnerPct = botConfig.runnerPct / 100; // e.g., 20 -> 0.20
+
+  const coreQty = totalBaseQty * primaryPct;
+  const runnerQty = totalBaseQty * runnerPct;
+  const coreCost = totalBaseCost * primaryPct;
+  const runnerCost = totalBaseCost * runnerPct;
+
+  logger.info('CORE exit with runner', {
+    instanceId,
+    totalBaseQty,
+    primaryPct,
+    runnerPct,
+    coreQty,
+    runnerQty,
+    coreCost,
+    runnerCost,
+  });
+
+  // Get quote for CORE portion
+  const coreQuote = await adapter.getQuote({
+    side,
+    amount: coreQty,
+    amountIsBase: true,
+    slippageBps: botConfig.maxSlippageBps,
+    allowedSources: botConfig.allowedSources,
+    excludedSources: botConfig.excludedSources,
+  });
+
+  // Verify execution cost
+  const costResult = costCalculator.calculateExecutionCost(coreQuote);
+  if (!costResult.shouldExecute) {
+    logger.warn('CORE exit rejected by cost gating', {
+      instanceId,
+      clientOrderId,
+      reason: costResult.rejectionReason,
+    });
+    return;
+  }
+
+  // Create trade attempt
+  const tradeAttempt = await prisma.tradeAttempt.create({
+    data: {
+      instanceId,
+      clientOrderId,
+      side,
+      status: 'PENDING',
+      isDryRun: botConfig.dryRunMode,
+      quotePrice: coreQuote.price,
+      quotedBaseQty: coreQuote.inputAmount,
+      quotedQuoteQty: coreQuote.outputAmount,
+      quotedPriceImpactBps: coreQuote.priceImpactBps,
+      quotedSlippageBps: botConfig.maxSlippageBps,
+    },
+  });
+
+  // Handle dry-run mode
+  if (botConfig.dryRunMode) {
+    logger.info('DRY RUN: Synthetic CORE exit with runner', {
+      clientOrderId,
+      coreQty,
+      runnerQty,
+    });
+
+    // Create synthetic fill for CORE
+    const costBasisPerUnit = totalBaseCost / totalBaseQty;
+    const realizedPnl = (currentPrice - costBasisPerUnit) * coreQty;
+
+    await prisma.tradeAttempt.update({
+      where: { id: tradeAttempt.id },
+      data: {
+        status: 'CONFIRMED',
+        confirmedAt: new Date(),
+      },
+    });
+
+    await prisma.tradeFill.create({
+      data: {
+        attemptId: tradeAttempt.id,
+        side,
+        baseQty: coreQty,
+        quoteQty: coreQty * currentPrice,
+        executedPrice: currentPrice,
+        feeQuote: 0,
+        feeNative: 0,
+        feeNativeUsdc: 0.001,
+        costBasisPerUnit,
+        realizedPnl,
+        txSignature: `DRY_RUN_CORE_${Date.now()}`,
+        executedAt: new Date(),
+      },
+    });
+
+    // Update instance after CORE exit - reduce position to runner qty only
+    await updateInstanceAfterCoreExit(instanceId, coreQty, coreCost, realizedPnl, instance);
+
+    // Create runner leg with remaining portion
+    await createRunnerLeg(instanceId, runnerQty, runnerCost, currentPrice);
+
+    logger.info('Synthetic CORE exit recorded, runner created', {
+      instanceId,
+      coreQty,
+      corePnl: realizedPnl,
+      runnerQty,
+      runnerCost,
+      isDryRun: true,
+    });
+    return;
+  }
+
+  // Real trade execution
+  await prisma.tradeAttempt.update({
+    where: { id: tradeAttempt.id },
+    data: { status: 'SUBMITTED', submittedAt: new Date() },
+  });
+
+  try {
+    const result = await adapter.executeSwap({
+      quote: coreQuote,
+      clientOrderId,
+    });
+
+    if (!result.success) {
+      await handleTradeFailure(instanceId, tradeAttempt.id, botConfig, result);
+      return;
+    }
+
+    // Calculate PnL for CORE portion
+    const costBasisPerUnit = totalBaseCost / totalBaseQty;
+    const coreFill: FillForPnL = {
+      side,
+      baseQty: result.inputAmount,
+      quoteQty: result.outputAmount,
+      executedPrice: result.executedPrice,
+      feeQuote: 0,
+      feeNativeUsdc: result.feeNativeUsdc,
+    };
+    const pnlResult = pnlCalculator.calculateRealizedPnL(coreFill, costBasisPerUnit);
+
+    // Update trade attempt status
+    await prisma.tradeAttempt.update({
+      where: { id: tradeAttempt.id },
+      data: {
+        status: 'CONFIRMED',
+        txSignature: result.txSignature,
+        confirmedAt: new Date(),
+      },
+    });
+
+    // Record fill
+    await prisma.tradeFill.create({
+      data: {
+        attemptId: tradeAttempt.id,
+        side,
+        baseQty: coreFill.baseQty,
+        quoteQty: coreFill.quoteQty,
+        executedPrice: coreFill.executedPrice,
+        feeQuote: 0,
+        feeNative: 0,
+        feeNativeUsdc: coreFill.feeNativeUsdc,
+        actualSlippageBps: null,
+        costBasisPerUnit,
+        realizedPnl: pnlResult.realizedPnl,
+        txSignature: result.txSignature,
+        executedAt: new Date(),
+      },
+    });
+
+    // Update instance - CORE portion sold, runner remains
+    await updateInstanceAfterCoreExit(instanceId, coreFill.baseQty, coreCost, pnlResult.realizedPnl, instance);
+
+    // Create runner leg with remaining portion
+    await createRunnerLeg(instanceId, runnerQty, runnerCost, result.executedPrice);
+
+    // Send alert
+    const alertService = new AlertService(
+      botConfig.webhookUrl ?? config.alerts.webhookUrl,
+      botConfig.discordWebhookUrl ?? config.alerts.discordWebhookUrl
+    );
+    await alertService.sendAlert({
+      instanceId,
+      type: 'TRADE_EXECUTED',
+      title: 'CORE Exit (Runner Created)',
+      message: `Sold ${coreFill.baseQty.toFixed(4)} @ ${coreFill.executedPrice.toFixed(4)} USDC. Runner started with ${runnerQty.toFixed(4)} remaining.`,
+      metadata: {
+        side,
+        coreQty: coreFill.baseQty,
+        runnerQty,
+        price: coreFill.executedPrice,
+        realizedPnl: pnlResult.realizedPnl,
+      },
+    });
+
+    logger.info('CORE exit executed, runner created', {
+      instanceId,
+      coreQty: coreFill.baseQty,
+      corePnl: pnlResult.realizedPnl,
+      runnerQty,
+      runnerCost,
+      runnerEntryPrice: result.executedPrice,
+    });
+  } catch (error) {
+    await prisma.tradeAttempt.update({
+      where: { id: tradeAttempt.id },
+      data: {
+        status: 'FAILED',
+        errorMessage: (error as Error).message,
+      },
+    });
+
+    logger.error('CORE exit error', {
+      instanceId,
+      clientOrderId,
+      error: (error as Error).message,
+    });
+  }
+}
+
+/**
+ * Update instance after CORE exit (reduces position, leaves runner qty separate)
+ */
+async function updateInstanceAfterCoreExit(
+  instanceId: string,
+  coreSoldQty: number,
+  coreSoldCost: number,
+  realizedPnl: number,
+  instance: BotInstance
+): Promise<void> {
+  // The runner qty is NOT included in totalBaseQty/totalBaseCost after this
+  // The instance tracking shows CORE position only
+  const newTotalBaseQty = instance.totalBaseQty - coreSoldQty;
+  const newTotalBaseCost = instance.totalBaseCost - coreSoldCost;
+
+  await prisma.botInstance.update({
+    where: { id: instanceId },
+    data: {
+      lastSellPrice: instance.lastBuyPrice, // Track the CORE exit
+      lastTradeAt: new Date(),
+      totalSells: { increment: 1 },
+      totalSellVolume: { increment: coreSoldQty },
+      dailyRealizedPnl: { increment: realizedPnl },
+      cumulativeRealizedPnL: { increment: realizedPnl },
+      // Reduce CORE tracking (runner tracked separately)
+      totalBaseQty: newTotalBaseQty,
+      totalBaseCost: newTotalBaseCost,
+      consecutiveFailures: 0,
+    },
+  });
+
+  logger.info('Instance updated after CORE exit', {
+    instanceId,
+    coreSoldQty,
+    realizedPnl,
+    newTotalBaseQty,
+    newTotalBaseCost,
   });
 }
 
@@ -2836,5 +3171,380 @@ async function updateInstanceAfterPrimaryExit(
   await prisma.botInstance.update({
     where: { id: instanceId },
     data: updateData,
+  });
+}
+
+// ============================================================
+// RUNNER (TWO-LEG POSITION MODEL) FUNCTIONS
+// ============================================================
+
+/**
+ * Build RunnerManager from bot config
+ */
+function buildRunnerManager(
+  botConfig: BotConfig,
+  costCalculator: ExecutionCostCalculator
+): RunnerManager {
+  const runnerConfig: RunnerConfig = {
+    enabled: botConfig.runnerEnabled,
+    runnerPct: botConfig.runnerPct,
+    mode: botConfig.runnerMode as 'LADDER' | 'TRAILING',
+    ladderTargets: botConfig.runnerLadderTargets,
+    ladderPercents: botConfig.runnerLadderPercents,
+    trailActivatePct: botConfig.runnerTrailActivatePct,
+    trailStopPct: botConfig.runnerTrailStopPct,
+    minDollarProfit: botConfig.runnerMinDollarProfit,
+  };
+
+  const costConfig: ExecutionCostConfig = {
+    baseSellTargetPct: botConfig.sellRisePct,
+    minimumNetEdgePct: botConfig.minimumNetEdgePct,
+    estimatedDexFeePct: botConfig.estimatedDexFeePct,
+    priorityFeeImpactPct: botConfig.priorityFeeImpactPct,
+    sellTargetTier1Pct: botConfig.sellTargetTier1Pct,
+    sellTargetTier2Pct: botConfig.sellTargetTier2Pct,
+    maxExecutionCostPct: botConfig.maxExecutionCostPct,
+  };
+
+  return new RunnerManager(runnerConfig, costConfig);
+}
+
+/**
+ * Build runner state data from instance
+ */
+function buildRunnerStateData(instance: BotInstance): RunnerStateData {
+  return {
+    state: (instance.runnerState as 'NONE' | 'ACTIVE') ?? 'NONE',
+    qty: instance.runnerQty ?? 0,
+    costBasis: instance.runnerCostBasis ?? 0,
+    entryPrice: instance.runnerEntryPrice ?? null,
+    peakPrice: instance.runnerPeakPrice ?? null,
+    startedAt: instance.runnerStartedAt ?? null,
+    ladderStep: instance.runnerLadderStep ?? 0,
+  };
+}
+
+/**
+ * Check if runner leg should exit
+ */
+async function checkRunnerExit(
+  instanceId: string,
+  instance: BotInstance,
+  adapter: ChainAdapter,
+  botConfig: BotConfig,
+  pnlCalculator: PnLCalculator,
+  costCalculator: ExecutionCostCalculator,
+  currentPrice: number,
+  portfolioValueUsdc: number,
+  quote: QuoteResult
+): Promise<boolean> {
+  const runnerManager = buildRunnerManager(botConfig, costCalculator);
+  const runnerState = buildRunnerStateData(instance);
+
+  if (runnerState.state !== 'ACTIVE' || runnerState.qty <= 0) {
+    return false;
+  }
+
+  // Calculate execution cost for runner sell
+  const costResult = costCalculator.calculateExecutionCost(quote);
+
+  // Evaluate runner exit decision
+  const decision = runnerManager.evaluateRunnerExit(runnerState, currentPrice, costResult);
+
+  // Log the decision
+  logger.info('Runner decision', {
+    instanceId,
+    runnerState: runnerState.state,
+    runnerMode: botConfig.runnerMode,
+    runnerQty: runnerState.qty,
+    runnerEntryPrice: runnerState.entryPrice,
+    runnerPeakPrice: runnerState.peakPrice,
+    executablePrice: currentPrice,
+    action: decision.action,
+    reason: decision.reason,
+    netEdgePct: decision.netEdgePct,
+    executionCostPct: decision.executionCostPct,
+  });
+
+  // Execute runner exit if needed
+  if (decision.action === 'SELL_LADDER_STEP' || decision.action === 'SELL_TRAILING_EXIT') {
+    await executeRunnerExit(
+      instanceId,
+      decision,
+      runnerState,
+      instance,
+      adapter,
+      botConfig,
+      pnlCalculator,
+      currentPrice
+    );
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Execute runner leg exit
+ */
+async function executeRunnerExit(
+  instanceId: string,
+  decision: RunnerDecision,
+  runnerState: RunnerStateData,
+  instance: BotInstance,
+  adapter: ChainAdapter,
+  botConfig: BotConfig,
+  pnlCalculator: PnLCalculator,
+  currentPrice: number
+): Promise<void> {
+  const side: TradeSide = 'SELL';
+  const clientOrderId = generateClientOrderId(instanceId, `RUNNER_${side}`, Date.now());
+
+  // Check for duplicate
+  const existing = await prisma.tradeAttempt.findUnique({
+    where: { clientOrderId },
+  });
+  if (existing) {
+    logger.warn('Duplicate runner order detected', { clientOrderId });
+    return;
+  }
+
+  // Get quote for runner sell
+  const runnerQuote = await adapter.getQuote({
+    side,
+    amount: decision.sellQty,
+    amountIsBase: true,
+    slippageBps: botConfig.maxSlippageBps,
+    allowedSources: botConfig.allowedSources,
+    excludedSources: botConfig.excludedSources,
+  });
+
+  // Create trade attempt
+  const tradeAttempt = await prisma.tradeAttempt.create({
+    data: {
+      instanceId,
+      clientOrderId,
+      side,
+      status: 'PENDING',
+      isDryRun: botConfig.dryRunMode,
+      quotePrice: runnerQuote.price,
+      quotedBaseQty: runnerQuote.inputAmount,
+      quotedQuoteQty: runnerQuote.outputAmount,
+      quotedPriceImpactBps: runnerQuote.priceImpactBps,
+      quotedSlippageBps: botConfig.maxSlippageBps,
+    },
+  });
+
+  logger.info('Executing runner exit', {
+    instanceId,
+    clientOrderId,
+    sellQty: decision.sellQty,
+    action: decision.action,
+    isDryRun: botConfig.dryRunMode,
+  });
+
+  if (botConfig.dryRunMode) {
+    // Synthetic runner exit
+    const costBasisPerUnit = runnerState.costBasis / runnerState.qty;
+    const realizedPnl = (currentPrice - costBasisPerUnit) * decision.sellQty;
+
+    await prisma.tradeAttempt.update({
+      where: { id: tradeAttempt.id },
+      data: { status: 'CONFIRMED' },
+    });
+
+    await prisma.tradeFill.create({
+      data: {
+        attemptId: tradeAttempt.id,
+        side,
+        baseQty: decision.sellQty,
+        quoteQty: decision.sellQty * currentPrice,
+        executedPrice: currentPrice,
+        costBasisPerUnit,
+        realizedPnl,
+        feeNativeUsdc: 0,
+        txSignature: `dry_run_runner_${Date.now()}`,
+        executedAt: new Date(),
+      },
+    });
+
+    await updateInstanceAfterRunnerSell(instanceId, decision, runnerState, realizedPnl);
+    return;
+  }
+
+  // Real trade execution
+  try {
+    const result = await adapter.executeSwap({ quote: runnerQuote, clientOrderId });
+
+    if (result.success) {
+      const baseQty = result.inputAmount;
+      const quoteQty = result.outputAmount;
+      const costBasisPerUnit = runnerState.costBasis / runnerState.qty;
+      const realizedPnl = (result.executedPrice - costBasisPerUnit) * baseQty - result.feeNativeUsdc;
+
+      await prisma.tradeAttempt.update({
+        where: { id: tradeAttempt.id },
+        data: {
+          status: 'CONFIRMED',
+          txSignature: result.txSignature,
+        },
+      });
+
+      await prisma.tradeFill.create({
+        data: {
+          attemptId: tradeAttempt.id,
+          side,
+          baseQty,
+          quoteQty,
+          executedPrice: result.executedPrice,
+          costBasisPerUnit,
+          realizedPnl,
+          feeNativeUsdc: result.feeNativeUsdc,
+          txSignature: result.txSignature,
+          executedAt: new Date(),
+        },
+      });
+
+      await updateInstanceAfterRunnerSell(instanceId, decision, runnerState, realizedPnl);
+
+      logger.info('Runner exit executed', {
+        instanceId,
+        clientOrderId,
+        executedPrice: result.executedPrice,
+        realizedPnl,
+      });
+    } else {
+      const errorMsg = result.error ? String(result.error) : 'Unknown error';
+      await prisma.tradeAttempt.update({
+        where: { id: tradeAttempt.id },
+        data: {
+          status: 'FAILED',
+          errorMessage: errorMsg,
+        },
+      });
+
+      logger.error('Runner exit failed', {
+        instanceId,
+        clientOrderId,
+        error: errorMsg,
+      });
+    }
+  } catch (error) {
+    await prisma.tradeAttempt.update({
+      where: { id: tradeAttempt.id },
+      data: {
+        status: 'FAILED',
+        errorMessage: (error as Error).message,
+      },
+    });
+
+    logger.error('Runner exit error', {
+      instanceId,
+      clientOrderId,
+      error: (error as Error).message,
+    });
+  }
+}
+
+/**
+ * Update instance after runner sell
+ */
+async function updateInstanceAfterRunnerSell(
+  instanceId: string,
+  decision: RunnerDecision,
+  runnerState: RunnerStateData,
+  realizedPnl: number
+): Promise<void> {
+  const newRunnerQty = runnerState.qty - decision.sellQty;
+  const soldCostBasis = runnerState.costBasis * (decision.sellQty / runnerState.qty);
+  const newRunnerCostBasis = runnerState.costBasis - soldCostBasis;
+  const isLadderStep = decision.action === 'SELL_LADDER_STEP';
+
+  const updateData: Record<string, unknown> = {
+    lastTradeAt: new Date(),
+    totalSells: { increment: 1 },
+    totalSellVolume: { increment: decision.sellQty * (runnerState.entryPrice ?? 0) },
+    dailyRealizedPnl: { increment: realizedPnl },
+    cumulativeRealizedPnL: { increment: realizedPnl },
+    // Update runner state
+    runnerQty: newRunnerQty,
+    runnerCostBasis: newRunnerCostBasis,
+  };
+
+  // Advance ladder step if applicable
+  if (isLadderStep) {
+    updateData.runnerLadderStep = runnerState.ladderStep + 1;
+  }
+
+  // If runner is depleted, reset runner state
+  if (newRunnerQty <= 0.0001) {
+    updateData.runnerState = 'NONE';
+    updateData.runnerQty = 0;
+    updateData.runnerCostBasis = 0;
+    updateData.runnerEntryPrice = null;
+    updateData.runnerPeakPrice = null;
+    updateData.runnerStartedAt = null;
+    updateData.runnerLadderStep = 0;
+  }
+
+  await prisma.botInstance.update({
+    where: { id: instanceId },
+    data: updateData,
+  });
+
+  logger.info('Runner state updated after sell', {
+    instanceId,
+    newRunnerQty,
+    newRunnerCostBasis,
+    realizedPnl,
+    runnerDepleted: newRunnerQty <= 0.0001,
+  });
+}
+
+/**
+ * Update runner peak price for trailing
+ */
+async function updateRunnerPeakPrice(
+  instanceId: string,
+  instance: BotInstance,
+  currentPrice: number
+): Promise<void> {
+  const currentPeak = instance.runnerPeakPrice ?? 0;
+
+  if (currentPrice > currentPeak) {
+    await prisma.botInstance.update({
+      where: { id: instanceId },
+      data: { runnerPeakPrice: currentPrice },
+    });
+  }
+}
+
+/**
+ * Create runner leg after CORE sell (called from executeSellWithScaleOut)
+ */
+async function createRunnerLeg(
+  instanceId: string,
+  runnerQty: number,
+  runnerCostBasis: number,
+  coreExitPrice: number
+): Promise<void> {
+  await prisma.botInstance.update({
+    where: { id: instanceId },
+    data: {
+      runnerState: 'ACTIVE',
+      runnerQty,
+      runnerCostBasis,
+      runnerEntryPrice: coreExitPrice,
+      runnerPeakPrice: coreExitPrice,
+      runnerStartedAt: new Date(),
+      runnerLadderStep: 0,
+    },
+  });
+
+  logger.info('Runner leg created', {
+    instanceId,
+    runnerQty,
+    runnerCostBasis,
+    runnerEntryPrice: coreExitPrice,
   });
 }

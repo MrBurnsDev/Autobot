@@ -87,6 +87,15 @@ const defaultConfig = {
   chaseDeployPctOfReserve: 33,
   chaseExitTargetPct: 1.2,
   chaseRegimeGate: 'TREND_UP_ONLY' as 'NONE' | 'TREND_UP_ONLY' | 'TREND_ONLY',
+  // Runner (two-leg position model) settings
+  runnerEnabled: false,
+  runnerPct: 20,
+  runnerMode: 'TRAILING' as 'LADDER' | 'TRAILING',
+  runnerLadderTargets: [] as number[],
+  runnerLadderPercents: [] as number[],
+  runnerTrailActivatePct: 1.8,
+  runnerTrailStopPct: 0.7,
+  runnerMinDollarProfit: 0,
 };
 
 export default function ConfigurePage() {
@@ -169,7 +178,7 @@ export default function ConfigurePage() {
       <p className="text-sm text-muted-foreground mb-3">
         Apply a preset to quickly configure your strategy. You can customize settings after applying.
       </p>
-      <div className="grid gap-3 md:grid-cols-3">
+      <div className="grid gap-3 md:grid-cols-5">
         {STRATEGY_PRESETS.map((preset) => (
           <button
             key={preset.id}
@@ -768,6 +777,164 @@ export default function ConfigurePage() {
         )}
       </div>
 
+      {/* Runner (Two-Leg Position Model) */}
+      {formData.cycleMode === 'ROLLING_REBUY' && (
+        <div className="space-y-4">
+          <h4 className="font-medium">Runner (Two-Leg Position)</h4>
+          <p className="text-sm text-muted-foreground">
+            After CORE sell, keep a portion as a &quot;Runner&quot; for extended profit capture
+          </p>
+
+          <div className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              id="runnerEnabled"
+              checked={formData.runnerEnabled}
+              onChange={(e) =>
+                setFormData({ ...formData, runnerEnabled: e.target.checked })
+              }
+              className="rounded border-border"
+            />
+            <label htmlFor="runnerEnabled" className="text-sm">
+              Enable Runner Leg
+            </label>
+          </div>
+
+          {formData.runnerEnabled && (
+            <>
+              <div>
+                <label className="block text-sm font-medium mb-1">
+                  Runner %: {formData.runnerPct}%
+                </label>
+                <input
+                  type="range"
+                  min="5"
+                  max="50"
+                  step="5"
+                  value={formData.runnerPct}
+                  onChange={(e) => {
+                    const runnerPct = parseFloat(e.target.value);
+                    setFormData({
+                      ...formData,
+                      runnerPct,
+                      primarySellPct: 100 - runnerPct, // Auto-adjust to sum to 100
+                    });
+                  }}
+                  className="w-full"
+                />
+                <p className="text-xs text-muted-foreground mt-1">
+                  CORE sells {100 - formData.runnerPct}%, Runner keeps {formData.runnerPct}%
+                </p>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium mb-1">Runner Exit Mode</label>
+                <select
+                  value={formData.runnerMode}
+                  onChange={(e) =>
+                    setFormData({
+                      ...formData,
+                      runnerMode: e.target.value as typeof formData.runnerMode,
+                    })
+                  }
+                  className="w-full rounded-md border border-border bg-secondary p-2"
+                >
+                  <option value="TRAILING">Trailing Stop (follow peak, exit on pullback)</option>
+                  <option value="LADDER">Ladder (multiple fixed targets)</option>
+                </select>
+              </div>
+
+              {formData.runnerMode === 'TRAILING' && (
+                <>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-sm font-medium mb-1">
+                        Trail Activate %: {formData.runnerTrailActivatePct}%
+                      </label>
+                      <input
+                        type="range"
+                        min="0.5"
+                        max="5"
+                        step="0.1"
+                        value={formData.runnerTrailActivatePct}
+                        onChange={(e) =>
+                          setFormData({
+                            ...formData,
+                            runnerTrailActivatePct: parseFloat(e.target.value),
+                          })
+                        }
+                        className="w-full"
+                      />
+                      <p className="text-xs text-muted-foreground mt-1">
+                        Start trailing after this % gain
+                      </p>
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium mb-1">
+                        Trail Stop %: {formData.runnerTrailStopPct}%
+                      </label>
+                      <input
+                        type="range"
+                        min="0.2"
+                        max="3"
+                        step="0.1"
+                        value={formData.runnerTrailStopPct}
+                        onChange={(e) =>
+                          setFormData({
+                            ...formData,
+                            runnerTrailStopPct: parseFloat(e.target.value),
+                          })
+                        }
+                        className="w-full"
+                      />
+                      <p className="text-xs text-muted-foreground mt-1">
+                        Exit on this % pullback from peak
+                      </p>
+                    </div>
+                  </div>
+                </>
+              )}
+
+              {formData.runnerMode === 'LADDER' && (
+                <div className="p-3 rounded-md bg-yellow-400/10 border border-yellow-400/20">
+                  <p className="text-sm text-yellow-500">
+                    Ladder mode targets must be configured via API. The UI supports Trailing mode.
+                  </p>
+                </div>
+              )}
+
+              <div>
+                <label className="block text-sm font-medium mb-1">
+                  Min Dollar Profit
+                </label>
+                <input
+                  type="number"
+                  value={formData.runnerMinDollarProfit}
+                  onChange={(e) =>
+                    setFormData({
+                      ...formData,
+                      runnerMinDollarProfit: parseFloat(e.target.value) || 0,
+                    })
+                  }
+                  className="w-full rounded-md border border-border bg-secondary p-2"
+                  step="0.01"
+                  min="0"
+                />
+                <p className="text-xs text-muted-foreground mt-1">
+                  Minimum dollar profit to exit runner (0 = any profit)
+                </p>
+              </div>
+
+              <div className="p-3 rounded-md bg-primary/10 border border-primary/20">
+                <p className="text-sm text-primary">
+                  <strong>Runner invariant:</strong> Runner NEVER realizes a loss. Profit-only exits enforced.
+                </p>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
       {/* Capital Allocation */}
       <div className="space-y-4 md:col-span-2 p-4 bg-secondary/30 rounded-lg border border-border">
         <h4 className="font-medium">Capital Allocation (Optional)</h4>
@@ -976,6 +1143,15 @@ export default function ConfigurePage() {
                           chaseDeployPctOfReserve: config.chaseDeployPctOfReserve ?? 33,
                           chaseExitTargetPct: config.chaseExitTargetPct ?? 1.2,
                           chaseRegimeGate: config.chaseRegimeGate ?? 'TREND_UP_ONLY',
+                          // Runner settings
+                          runnerEnabled: config.runnerEnabled ?? false,
+                          runnerPct: config.runnerPct ?? 20,
+                          runnerMode: config.runnerMode ?? 'TRAILING',
+                          runnerLadderTargets: config.runnerLadderTargets ?? [],
+                          runnerLadderPercents: config.runnerLadderPercents ?? [],
+                          runnerTrailActivatePct: config.runnerTrailActivatePct ?? 1.8,
+                          runnerTrailStopPct: config.runnerTrailStopPct ?? 0.7,
+                          runnerMinDollarProfit: config.runnerMinDollarProfit ?? 0,
                         });
                       }}
                     >

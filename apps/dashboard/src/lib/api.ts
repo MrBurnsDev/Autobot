@@ -66,6 +66,15 @@ export interface BotConfig {
   chaseDeployPctOfReserve: number;
   chaseExitTargetPct: number;
   chaseRegimeGate: 'NONE' | 'TREND_UP_ONLY' | 'TREND_ONLY';
+  // Runner (two-leg position model)
+  runnerEnabled: boolean;
+  runnerPct: number;
+  runnerMode: 'LADDER' | 'TRAILING';
+  runnerLadderTargets: number[];
+  runnerLadderPercents: number[];
+  runnerTrailActivatePct: number;
+  runnerTrailStopPct: number;
+  runnerMinDollarProfit: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -104,6 +113,14 @@ export interface BotInstance {
   pendingBuyUSDC?: number;
   pendingSellSOL?: number;
   cumulativeRealizedPnL?: number;
+  // Runner leg state (two-leg position model)
+  runnerState?: 'NONE' | 'ACTIVE';
+  runnerQty?: number;
+  runnerCostBasis?: number;
+  runnerEntryPrice?: number | null;
+  runnerPeakPrice?: number | null;
+  runnerStartedAt?: string | null;
+  runnerLadderStep?: number;
 }
 
 export interface BotStatus {
@@ -169,12 +186,18 @@ export interface PnLSummary {
 }
 
 async function fetchApi<T>(endpoint: string, options?: RequestInit): Promise<T> {
+  const headers: HeadersInit = {
+    ...options?.headers,
+  };
+
+  // Only set Content-Type for requests with a body
+  if (options?.body) {
+    (headers as Record<string, string>)['Content-Type'] = 'application/json';
+  }
+
   const res = await fetch(`${API_BASE}${endpoint}`, {
     ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      ...options?.headers,
-    },
+    headers,
   });
 
   if (!res.ok) {
